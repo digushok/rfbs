@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ozon rFBS</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="top-in">
+    <div class="brand"><img src="icon.svg" alt="" class="logo"><div><b>Ozon rFBS</b><span>остатки и статусы заказов</span></div></div>
+    <nav class="tabs">
+      <button data-tab="orders" class="on">Заказы</button>
+      <button data-tab="log">Журнал</button>
+      <button data-tab="settings">Настройки</button>
+    </nav>
+    <div class="shop">
+      <span id="runDot" class="dot" title="Автоматизация"></span>
+      <select id="shopSel" title="Магазин"></select>
+      <button class="icon-btn" id="quitBtn" title="Закрыть программу">⏻</button>
+    </div>
+  </div>
+</header>
+
+<main>
+  <!-- ======================= ЗАКАЗЫ ======================= -->
+  <section id="tab-orders" class="tab">
+    <div id="demoNote" class="banner hidden"><b>Демо-магазин.</b> Запросы идут в демо-Озон внутри программы, в настоящий магазин ничего не отправляется. Новые демо-заказы появляются примерно раз в 2 минуты, окно доставки у них около 10 минут.</div>
+    <div id="keyNote" class="banner warn hidden">Чтобы начать, укажите Client-Id и API-ключ во вкладке «Настройки».</div>
+    <div id="testNote" class="banner test hidden"><b>Тестовый режим.</b> Программа читает настоящие заказы из Ozon и показывает, что и когда она сделала бы. Статусы и остатки в Ozon <b>не меняются</b>. Шаги симулируются и пишутся в журнал с пометкой [ТЕСТ].</div>
+    <div id="liveNote" class="banner err hidden"><b>Боевой режим.</b> Программа по-настоящему меняет статусы заказов и остатки в Ozon.</div>
+
+    <div class="card">
+      <div class="card-h"><span class="step">1</span><div><h2>Склад и товары</h2><p class="sub">Целевой заказ: оба SKU по 1 шт. с этого склада, и больше ничего</p></div></div>
+      <div class="form3">
+        <label class="fld">Склад
+          <div class="row tight"><select id="whSel" class="grow"></select><button class="btn ghost sm" id="whReload" title="Загрузить склады из Ozon">↻</button></div>
+        </label>
+        <label class="fld">SKU Ozon № 1<input id="sku1" inputmode="numeric" placeholder="например, 5980291763"></label>
+        <label class="fld">SKU Ozon № 2<input id="sku2" inputmode="numeric" placeholder="SKU второго товара"></label>
+      </div>
+      <div id="prodInfo" class="prods"></div>
+      <div class="row"><button class="btn primary" id="cfgSave">Сохранить</button><span id="cfgMsg" class="muted"></span></div>
+    </div>
+
+    <div class="card">
+      <div class="card-h"><span class="step">2</span><div><h2>Остатки</h2><p class="sub">Один раз выставляет одинаковый остаток обоим SKU на выбранном складе</p></div></div>
+      <div class="row">
+        <label class="fld inline">Количество каждого SKU, шт.<input type="number" id="stockQty" min="0" class="w110"></label>
+        <button class="btn primary" id="stockApply">Выставить остатки</button>
+        <button class="btn ghost" id="stockReload">↻ Обновить текущие</button>
+      </div>
+      <div id="stockMsg" class="msgs"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-h"><span class="step">3</span><div><h2>Автоматизация</h2><p class="sub">Собрать → Доставляется → Курьер в пути (пауза между шагами) → Условно доставлен перед концом окна доставки</p></div></div>
+      <div class="auto">
+        <div class="seg big" id="modeSeg">
+          <label><input type="radio" name="mode" value="test"><span>🧪 Тестовый режим</span></label>
+          <label><input type="radio" name="mode" value="live"><span>⚡ Боевой режим</span></label>
+        </div>
+        <button class="btn primary lg" id="runBtn">Запустить</button>
+        <div class="runinfo" id="runInfo"></div>
+      </div>
+      <div class="row wrap">
+        <button class="btn soft sm" id="pollNow">Проверить заказы сейчас</button>
+        <button class="btn ghost sm" id="testReset" title="Забыть симулированные шаги и прогнать тест заново">Сбросить тестовый прогон</button>
+        <span id="demoBtns" class="hidden">
+          <span class="muted small">Демо-заказ:</span>
+          <button class="btn ghost sm" data-kind="target">целевой</button>
+          <button class="btn ghost sm" data-kind="single">1 товар</button>
+          <button class="btn ghost sm" data-kind="double">2 шт. одного SKU</button>
+          <button class="btn ghost sm" data-kind="other">другой товар</button>
+        </span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-h"><span class="step">4</span><div><h2>Целевые заказы</h2><p class="sub" id="ordersSub">Время — по часам этого компьютера. «~» — запланировано, «✓» — выполнено</p></div></div>
+      <div class="scroll"><table class="grid" id="ordersTable">
+        <thead><tr><th>Отправление</th><th>Окно доставки</th><th>Собрать</th><th>Доставляется</th><th>Курьер в пути</th><th>Условно доставлен</th><th>Сейчас</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <div id="ordersEmpty" class="empty muted">Пока нет целевых заказов.</div>
+    </div>
+
+    <details class="card skipped">
+      <summary><b>Пропущенные заказы</b> <span class="muted" id="skipCount"></span><span class="muted small"> — не подходят по составу или складу, программа их не трогает</span></summary>
+      <div class="scroll"><table class="grid" id="skipTable">
+        <thead><tr><th>Отправление</th><th>Создан</th><th>Состав (SKU×шт)</th><th>Статус</th><th>Причина</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </details>
+  </section>
+
+  <!-- ======================= ЖУРНАЛ ======================= -->
+  <section id="tab-log" class="tab hidden">
+    <div class="card">
+      <div class="card-h"><div><h2>Журнал</h2><p class="sub">Всё, что программа делала и сделала бы в тестовом режиме. Полный журнал хранится в папке данных.</p></div>
+        <div class="actions">
+          <div class="seg" id="logFilter">
+            <label><input type="radio" name="lf" value="" checked><span>Все</span></label>
+            <label><input type="radio" name="lf" value="act"><span>Действия</span></label>
+            <label><input type="radio" name="lf" value="err"><span>Ошибки</span></label>
+          </div>
+        </div>
+      </div>
+      <div id="logList" class="log"></div>
+    </div>
+  </section>
+
+  <!-- ======================= НАСТРОЙКИ ======================= -->
+  <section id="tab-settings" class="tab hidden">
+    <div class="card">
+      <div class="card-h"><div><h2>Магазин</h2><p class="sub">Ключ создаётся в кабинете Ozon: Настройки → Seller API. Нужные роли: «Posting FBS», «Stocks» (или «Product»)</p></div></div>
+      <div class="form2">
+        <label class="fld">Название<input id="sName"></label>
+        <label class="fld">Client-Id<input id="sClient" autocomplete="off"></label>
+        <label class="fld">API-ключ<input id="sKey" type="password" autocomplete="new-password"></label>
+        <span></span>
+      </div>
+      <div class="row"><button class="btn primary" id="sSave">Сохранить</button><button class="btn soft" id="sCheck">Проверить подключение</button><span id="sMsg" class="muted"></span></div>
+    </div>
+
+    <div class="card">
+      <div class="card-h"><div><h2>Параметры автоматизации</h2></div></div>
+      <div class="form2">
+        <label class="fld">Пауза между шагами, сек.<input type="number" id="pPause" min="10"></label>
+        <label class="fld">Запас до конца окна доставки, мин.<input type="number" id="pMargin" min="0"></label>
+        <label class="fld">Опрашивать Ozon каждые, сек.<input type="number" id="pPoll" min="15"></label>
+        <label class="fld">Смотреть заказы за последние, дн.<input type="number" id="pLook" min="1"></label>
+      </div>
+      <div class="row"><button class="btn primary" id="pSave">Сохранить</button><span id="pMsg" class="muted"></span></div>
+    </div>
+
+    <div class="card">
+      <div class="card-h"><div><h2>Магазины на этом компьютере</h2><p class="sub">Автоматизация каждого магазина работает независимо, даже если в окне выбран другой</p></div>
+        <div class="actions"><button class="btn soft" id="shopNew">+ Магазин</button><button class="btn ghost" id="shopDemo">+ Демо-магазин</button></div></div>
+      <div id="sShops" class="shops"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-h"><div><h2>Данные программы</h2><p class="sub">Ключи, настройки, журналы и логи хранятся здесь и не пропадают при замене .exe</p></div>
+        <div class="actions"><button class="btn ghost" id="dOpen">Открыть папку</button></div></div>
+      <div class="pathbox muted" id="dataDir"></div>
+      <p class="muted small">Программа работает, пока она запущена и компьютер включён. Закрытие вкладки браузера её не останавливает. Чтобы выйти, нажмите ⏻. При следующем запуске включённая автоматизация продолжит работу сама.</p>
+    </div>
+  </section>
+</main>
+
+<footer class="foot-bar"><span id="verFoot">Ozon rFBS</span></footer>
+<div id="toast" class="toast hidden"></div>
+<div id="modal" class="modal hidden"><div class="modal-box"><div id="modalBody"></div><div class="row r"><button class="btn ghost" id="modalNo">Отмена</button><button class="btn primary" id="modalYes">Да</button></div></div></div>
+<script src="app.js"></script>
+</body>
+</html>
