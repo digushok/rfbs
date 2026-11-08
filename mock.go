@@ -30,21 +30,26 @@ type mockProduct struct {
 }
 
 type MockOzon struct {
-	mu        sync.Mutex
-	now       func() time.Time
-	rnd       *rand.Rand
-	products  []mockProduct
-	stock     map[int64]int // по SKU на демо-складе
-	postings  []*Posting
-	nextOrder time.Time
-	seq       int
+	mu            sync.Mutex
+	now           func() time.Time
+	rnd           *rand.Rand
+	products      []mockProduct
+	stock         map[int64]int // по SKU на демо-складе
+	postings      []*Posting
+	nextOrder     time.Time
+	seq           int
+	Calls         map[string]int  // сколько раз вызван каждый метод
+	Fail          map[string]bool // принудительная ошибка метода (для тестов)
+	LastMileState [2]string       // статус/подстатус после «курьер в пути»
 	// Окно доставки демо-заказа относительно момента заказа.
 	WindowStart, WindowEnd time.Duration
 	OrderEvery             time.Duration
+	WindowFn               func(now time.Time) (begin, end time.Time) // своё окно доставки (для тестов)
 }
 
 func NewMockOzon(now func() time.Time) *MockOzon {
 	m := &MockOzon{now: now, rnd: rand.New(rand.NewSource(now().UnixNano())), stock: map[int64]int{},
+		Calls: map[string]int{}, LastMileState: [2]string{"driver_pickup", "posting_driver_pick_up"},
 		WindowStart: 4 * time.Minute, WindowEnd: 10 * time.Minute, OrderEvery: 2 * time.Minute}
 	m.products = []mockProduct{
 		{mockSKU1, 811001, "CASE-BLACK-01", "Чехол для телефона, чёрный"},
@@ -112,6 +117,10 @@ func (m *MockOzon) AddPosting(kind string) *Posting {
 	}{WarehouseID: p.DeliveryMethod.WarehouseID, City: "Москва"}
 	p.AnalyticsData.DeliveryDateBegin.Time = now.Add(m.WindowStart).Truncate(time.Minute)
 	p.AnalyticsData.DeliveryDateEnd.Time = now.Add(m.WindowEnd).Truncate(time.Minute)
+	if m.WindowFn != nil {
+		b, e := m.WindowFn(now)
+		p.AnalyticsData.DeliveryDateBegin.Time, p.AnalyticsData.DeliveryDateEnd.Time = b, e
+	}
 	m.postings = append(m.postings, p)
 	return p
 }
@@ -122,6 +131,9 @@ func (m *MockOzon) generate() {
 	}
 	for !m.now().Before(m.nextOrder) {
 		kinds := []string{"target", "target", "target", "single", "double", "other", "other_wh"}
+		if m.WindowFn != nil {
+			kinds = []string{"target", "target", "target", "target", "other"}
+		}
 		k := kinds[m.rnd.Intn(len(kinds))]
 		if k == "target" && (m.stock[mockSKU1] <= 0 || m.stock[mockSKU2] <= 0) {
 			k = "other"
@@ -144,6 +156,10 @@ func (m *MockOzon) Handle(path string, body []byte) (int, any) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.generate()
+	m.Calls[path]++
+	if m.Fail[path] {
+		return 400, map[string]any{"code": 3, "message": "демо: принудительная ошибка"}
+	}
 	var req map[string]any
 	json.Unmarshal(body, &req)
 	errResp := func(code int, msg string) (int, any) {
@@ -216,14 +232,37 @@ func (m *MockOzon) Handle(path string, body []byte) (int, any) {
 	case "/v3/posting/fbs/list":
 		f, _ := req["filter"].(map[string]any)
 		whs := toIntList(f["warehouse_id"])
+		status, _ := f["status"].(string)
+		limit, offset := int(toInt(req["limit"])), int(toInt(req["offset"]))
+		if limit <= 0 || limit > 1000 {
+			limit = 1000
+		}
 		var out []*Posting
 		for _, p := range m.postings {
 			if len(whs) > 0 && whs[0] != p.DeliveryMethod.WarehouseID {
 				continue
 			}
+			if status != "" && p.Status != status {
+				continue
+			}
 			out = append(out, p)
 		}
-		return 200, map[string]any{"result": map[string]any{"postings": out, "has_next": false}}
+		hasNext := false
+		if offset > len(out) {
+			offset = len(out)
+		}
+		out = out[offset:]
+		if len(out) > limit {
+			out, hasNext = out[:limit], true
+		}
+		return 200, map[string]any{"result": map[string]any{"postings": out, "has_next": hasNext}}
+	case "/v3/posting/fbs/get":
+		pn, _ := req["posting_number"].(string)
+		p := m.find(pn)
+		if p == nil {
+			return errResp(404, "POSTING_NOT_FOUND")
+		}
+		return 200, map[string]any{"result": p}
 	case "/v4/posting/fbs/ship":
 		pn, _ := req["posting_number"].(string)
 		p := m.find(pn)
@@ -245,9 +284,9 @@ func (m *MockOzon) Handle(path string, body []byte) (int, any) {
 				errText = "POSTING_NOT_FOUND"
 			case path == "/v2/fbs/posting/delivering" && p.Status == "awaiting_deliver":
 				p.Status, p.Substatus, ok = "delivering", "posting_transferring_to_delivery", true
-			case path == "/v2/fbs/posting/last-mile" && p.Status == "delivering":
-				p.Status, p.Substatus, ok = "driver_pickup", "posting_driver_pick_up", true
-			case path == "/v2/fbs/posting/delivered" && (p.Status == "driver_pickup" || p.Status == "delivering"):
+			case path == "/v2/fbs/posting/last-mile" && p.Status == "delivering" && p.Substatus != m.LastMileState[1]:
+				p.Status, p.Substatus, ok = m.LastMileState[0], m.LastMileState[1], true
+			case path == "/v2/fbs/posting/delivered" && (p.Status == m.LastMileState[0] || p.Status == "delivering"):
 				p.Status, p.Substatus, ok = "delivered", "posting_conditionally_delivered", true
 			default:
 				errText = "INVALID_POSTING_STATUS: " + p.Status

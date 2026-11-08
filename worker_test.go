@@ -24,7 +24,7 @@ func setup(t *testing.T, live bool) (*Worker, *MockOzon, *clock) {
 	c := &Client{base: "http://demo", http: &http.Client{Transport: m}}
 	dir := t.TempDir()
 	w := NewWorker(prof, c, LoadJournal(filepath.Join(dir, "j.json")), NewShopLog(dir, "t"))
-	w.now = ck.now
+	w.clock = ck.now
 	return w, m, ck
 }
 
@@ -212,5 +212,72 @@ func TestVersionLess(t *testing.T) {
 		if got := versionLess(c.a, c.b); got != c.want {
 			t.Errorf("%s < %s: ожидали %v", c.a, c.b, c.want)
 		}
+	}
+}
+
+func TestClockOffset(t *testing.T) {
+	c := &Client{}
+	sent := time.Now()
+	server := sent.Add(4 * time.Minute)
+	c.noteDate(server.UTC().Format(http.TimeFormat), sent, sent.Add(200*time.Millisecond))
+	off, ok := c.ClockOffset()
+	if !ok || off < 4*time.Minute-2*time.Second || off > 4*time.Minute+2*time.Second {
+		t.Fatalf("ожидали разницу около 4 минут, получили %v", off)
+	}
+}
+
+func TestRetryDelay(t *testing.T) {
+	if retryDelay(1) != 30*time.Second || retryDelay(2) != time.Minute || retryDelay(20) != maxRetryDelay {
+		t.Fatalf("неверные паузы повтора: %v %v %v", retryDelay(1), retryDelay(2), retryDelay(20))
+	}
+}
+
+func TestErrorBackoff(t *testing.T) {
+	w, m, ck := setup(t, true)
+	target := m.AddPosting("target")
+	m.Fail = map[string]bool{"/v4/posting/fbs/ship": true}
+	ctx := context.Background()
+	// 10 минут циклов каждые 15 секунд: при паузах 30с, 1м, 2м, 4м — не больше 5 попыток.
+	for i := 0; i < 40; i++ {
+		w.Tick(ctx)
+		ck.add(15 * time.Second)
+	}
+	if n := m.Calls["/v4/posting/fbs/ship"]; n < 3 || n > 5 {
+		t.Fatalf("ожидали 3–5 попыток «Собрать» с нарастающей паузой, было %d", n)
+	}
+	e := w.journal.Peek(target.PostingNumber)
+	if e.LastError == "" || e.NextTry.IsZero() {
+		t.Fatalf("ошибка должна быть видна в журнале")
+	}
+	// Ozon «починился» — заказ продолжает путь.
+	m.Fail = nil
+	ck.t = e.NextTry
+	w.Tick(ctx)
+	if target.Status != "awaiting_deliver" {
+		t.Fatalf("после восстановления ожидали awaiting_deliver, получили %s", target.Status)
+	}
+	if e.LastError != "" || e.Fails != 0 {
+		t.Fatalf("ошибка должна сброситься после успеха")
+	}
+}
+
+func TestConcurrentStartSingleWorker(t *testing.T) {
+	dir := t.TempDir()
+	store := LoadStore(dir)
+	mgr := NewManager(dir, store, NewMockRegistry())
+	id, _ := store.Snapshot()
+	done := make(chan struct{})
+	for i := 0; i < 8; i++ {
+		go func() { mgr.Start(id); done <- struct{}{} }()
+	}
+	for i := 0; i < 8; i++ {
+		<-done
+	}
+	mgr.mu.Lock()
+	n := len(mgr.workers)
+	mgr.mu.Unlock()
+	mgr.StopAll()
+	if n != 1 {
+		t.Fatalf("ожидали одного работника, получили %d", n)
 	}
 }

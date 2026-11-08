@@ -30,6 +30,11 @@ func (s *Server) handle(mux *http.ServeMux, path string, fn apiFunc) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-App", "ozon-rfbs")
+		// Защита от запросов с чужих сайтов (в том числе через подмену DNS): только своя страница.
+		if h := r.Host; !strings.HasPrefix(h, "127.0.0.1:") && !strings.HasPrefix(h, "localhost:") {
+			w.WriteHeader(403)
+			return
+		}
 		// Защита от запросов с чужих сайтов: принимаем только со своей страницы.
 		if o := r.Header.Get("Origin"); o != "" && !strings.HasPrefix(o, "http://127.0.0.1:") && !strings.HasPrefix(o, "http://localhost:") {
 			w.WriteHeader(403)

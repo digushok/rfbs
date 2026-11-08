@@ -88,7 +88,6 @@ type PostingView struct {
 	OrderNumber   string       `json:"order_number"`
 	Created       time.Time    `json:"created"`
 	Status        string       `json:"status"`
-	Substatus     string       `json:"substatus"`
 	Stage         int          `json:"stage"`
 	Final         string       `json:"final,omitempty"`
 	WindowBegin   time.Time    `json:"window_begin"`
@@ -109,6 +108,15 @@ type SkipView struct {
 	Products      string    `json:"products"`
 }
 
+// Статусы, в которых заказ ещё может требовать действий программы.
+var listStatuses = []string{"awaiting_packaging", "awaiting_deliver", "delivering", "driver_pickup"}
+
+const (
+	batchSize     = 50        // отправлений в одном запросе смены статуса
+	recheckEvery  = time.Hour // как часто перепроверять заказ, пропавший из списков (и всегда — когда подошёл шаг)
+	maxRetryDelay = 10 * time.Minute
+)
+
 type Worker struct {
 	prof    Profile
 	client  *Client
@@ -117,7 +125,7 @@ type Worker struct {
 	cancel  context.CancelFunc
 	done    chan struct{}
 	kick    chan struct{}
-	now     func() time.Time
+	clock   func() time.Time
 
 	mu        sync.Mutex
 	started   time.Time
@@ -126,13 +134,23 @@ type Worker struct {
 	lastErr   string
 	views     []PostingView
 	skipped   []SkipView
-	loggedFor map[string]string // что уже записано в лог по отправлению, чтобы не повторяться
+	loggedFor map[string]bool // что уже записано в лог, чтобы не повторяться
+	badStatus map[string]bool // статусы, которые Ozon не принимает в фильтре
 }
 
 func NewWorker(prof Profile, client *Client, journal *Journal, log *ShopLog) *Worker {
 	client.readOnly = !prof.Live
-	return &Worker{prof: prof, client: client, journal: journal, log: log, now: time.Now,
-		kick: make(chan struct{}, 1), loggedFor: map[string]string{}}
+	return &Worker{prof: prof, client: client, journal: journal, log: log, clock: time.Now,
+		kick: make(chan struct{}, 1), loggedFor: map[string]bool{}, badStatus: map[string]bool{}}
+}
+
+// now — текущее время по часам Ozon (часы компьютера + измеренная разница).
+func (w *Worker) now() time.Time {
+	t := w.clock()
+	if off, ok := w.client.ClockOffset(); ok {
+		t = t.Add(off)
+	}
+	return t
 }
 
 func (w *Worker) Start() {
@@ -152,12 +170,12 @@ func (w *Worker) Start() {
 			next := w.Tick(ctx)
 			wait := time.Duration(w.prof.PollSec) * time.Second
 			if !next.IsZero() {
-				if d := next.Sub(w.now()) + 2*time.Second; d < wait {
+				if d := next.Sub(w.now()) + time.Second; d < wait {
 					wait = d
 				}
 			}
-			if wait < 3*time.Second {
-				wait = 3 * time.Second
+			if wait < 2*time.Second {
+				wait = 2 * time.Second
 			}
 			w.mu.Lock()
 			w.nextPoll = w.now().Add(wait)
@@ -176,6 +194,7 @@ func (w *Worker) Stop() {
 	if w.cancel != nil {
 		w.cancel()
 		<-w.done
+		w.journal.Save()
 		w.log.Add("info", "Автоматизация остановлена.")
 	}
 }
@@ -187,15 +206,28 @@ func (w *Worker) Kick() {
 	}
 }
 
-func (w *Worker) logOnce(pn, key, level, format string, args ...any) {
+func (w *Worker) logOnce(key, level, format string, args ...any) {
 	w.mu.Lock()
-	if w.loggedFor[pn+"|"+key] != "" {
+	if w.loggedFor[key] {
 		w.mu.Unlock()
 		return
 	}
-	w.loggedFor[pn+"|"+key] = "1"
+	if len(w.loggedFor) > 50000 {
+		w.loggedFor = map[string]bool{}
+	}
+	w.loggedFor[key] = true
 	w.mu.Unlock()
 	w.log.Add(level, format, args...)
+}
+
+func (w *Worker) setErr(err error) {
+	w.mu.Lock()
+	changed := w.lastErr != err.Error()
+	w.lastErr = err.Error()
+	w.mu.Unlock()
+	if changed {
+		w.log.Add("err", "%v", err)
+	}
 }
 
 func productsText(p *Posting) string {
@@ -206,24 +238,94 @@ func productsText(p *Posting) string {
 	return strings.Join(s, " + ")
 }
 
+func retryDelay(fails int) time.Duration {
+	d := 30 * time.Second
+	for i := 1; i < fails && d < maxRetryDelay; i++ {
+		d *= 2
+	}
+	if d > maxRetryDelay {
+		d = maxRetryDelay
+	}
+	return d
+}
+
+type pendingAction struct {
+	p    *Posting
+	e    *JEntry
+	next int
+}
+
+// fetch — активные отправления склада и отслеживаемые заказы, пропавшие из списков.
+func (w *Worker) fetch(ctx context.Context, now time.Time) ([]*Posting, error) {
+	since := now.AddDate(0, 0, -w.prof.LookbackDays)
+	to := now.Add(24 * time.Hour)
+	seen := map[string]bool{}
+	var out []*Posting
+	for _, st := range listStatuses {
+		if w.badStatus[st] {
+			continue
+		}
+		ps, err := w.client.ListPostings(ctx, w.prof.WarehouseID, st, since, to)
+		if err != nil {
+			var oe *OzonError
+			switch {
+			case ctx.Err() != nil:
+				return nil, ctx.Err()
+			case len(ps) > 0: // список обрезан — работаем с тем, что есть
+				w.logOnce("trunc|"+st, "warn", "Внимание: %v", err)
+			case st != "awaiting_packaging" && errors.As(err, &oe) && oe.Status >= 400 && oe.Status < 500 && oe.Status != 429 && oe.Status != 401 && oe.Status != 403:
+				w.badStatus[st] = true
+				w.log.Add("warn", "Ozon не принимает фильтр по статусу %s (%v). Такие заказы будут проверяться по одному.", st, err)
+				continue
+			default:
+				return nil, fmt.Errorf("не удалось получить заказы (%s): %w", st, err)
+			}
+		}
+		for i := range ps {
+			if !seen[ps[i].PostingNumber] {
+				seen[ps[i].PostingNumber] = true
+				out = append(out, &ps[i])
+			}
+		}
+	}
+	// Заказы, которые программа ведёт, но которых нет в списках (неизвестный статус после «курьер в пути» и т.п.):
+	// перепроверяем по одному — редко, но обязательно, когда подошло время следующего шага.
+	checked := 0
+	for _, e := range w.journal.All() {
+		if seen[e.PostingNumber] || e.Final != "" || e.Stage < 0 || checked >= 100 {
+			continue
+		}
+		dueNow := !e.DueAt.IsZero() && !e.DueAt.After(now)
+		if !dueNow && now.Sub(e.SeenAt) < recheckEvery {
+			continue
+		}
+		checked++
+		p, err := w.client.GetPosting(ctx, e.PostingNumber)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			e.SeenAt = now // не долбим каждые 30 секунд
+			e.LastError = "не удалось получить заказ из Ozon: " + err.Error()
+			w.journal.MarkDirty()
+			continue
+		}
+		seen[p.PostingNumber] = true
+		out = append(out, p)
+	}
+	return out, nil
+}
+
 // Tick — один цикл: прочитать заказы и выполнить всё, что пора. Возвращает время ближайшего дела.
 func (w *Worker) Tick(ctx context.Context) time.Time {
 	now := w.now()
-	since := now.AddDate(0, 0, -w.prof.LookbackDays)
-	postings, err := w.client.ListPostings(ctx, w.prof.WarehouseID, since, now.Add(24*time.Hour))
+	postings, err := w.fetch(ctx, now)
 	w.mu.Lock()
 	w.lastPoll = now
 	w.mu.Unlock()
 	if err != nil {
-		if ctx.Err() != nil {
-			return time.Time{}
-		}
-		w.mu.Lock()
-		changed := w.lastErr != err.Error()
-		w.lastErr = err.Error()
-		w.mu.Unlock()
-		if changed {
-			w.log.Add("err", "Не удалось получить заказы: %v", err)
+		if ctx.Err() == nil {
+			w.setErr(err)
 		}
 		return time.Time{}
 	}
@@ -233,40 +335,31 @@ func (w *Worker) Tick(ctx context.Context) time.Time {
 	}
 	w.lastErr = ""
 	w.mu.Unlock()
+	if off, ok := w.client.ClockOffset(); ok && (off > time.Minute || off < -time.Minute) {
+		w.logOnce("clock", "warn", "Часы компьютера расходятся с Ozon на %s. Программа учитывает разницу, но лучше включить синхронизацию времени в Windows.", off.Round(time.Second))
+	}
 
-	var views []PostingView
 	var skipped []SkipView
-	var nextDue time.Time
-	for i := range postings {
-		p := &postings[i]
+	var pend []pendingAction
+	for _, p := range postings {
 		if ctx.Err() != nil {
 			return time.Time{}
 		}
 		if reason := checkTarget(p, &w.prof); reason != "" {
-			_, ok, final := realStage(p)
-			if ok && final == "" {
+			if _, ok, final := realStage(p); ok && final == "" && len(skipped) < 300 {
 				skipped = append(skipped, SkipView{PostingNumber: p.PostingNumber, Status: p.Status, Reason: reason, Created: p.InProcessAt.Time, Products: productsText(p)})
-				w.logOnce(p.PostingNumber, "skip", "info", "Заказ %s пропущен — не целевой: %s.", p.PostingNumber, reason)
 			}
+			w.logOnce("skip|"+p.PostingNumber, "info", "Заказ %s пропущен — не целевой: %s.", p.PostingNumber, reason)
 			continue
 		}
-		v, due := w.process(ctx, p, now)
-		views = append(views, v)
-		if !due.IsZero() && (nextDue.IsZero() || due.Before(nextDue)) {
-			nextDue = due
+		if a, ok := w.update(p, now); ok {
+			pend = append(pend, a)
 		}
 	}
+	w.execute(ctx, pend, now)
 	w.journal.Save()
-	sort.Slice(views, func(i, j int) bool {
-		fi, fj := views[i].Final != "", views[j].Final != ""
-		if fi != fj {
-			return !fi
-		}
-		return views[i].Created.After(views[j].Created)
-	})
-	if len(views) > 200 {
-		views = views[:200]
-	}
+
+	views, nextDue := w.buildViews(now)
 	sort.Slice(skipped, func(i, j int) bool { return skipped[i].Created.After(skipped[j].Created) })
 	w.mu.Lock()
 	w.views, w.skipped = views, skipped
@@ -274,139 +367,231 @@ func (w *Worker) Tick(ctx context.Context) time.Time {
 	return nextDue
 }
 
+// update синхронизирует запись журнала с данными Ozon и решает, пора ли делать следующий шаг.
+func (w *Worker) update(p *Posting, now time.Time) (pendingAction, bool) {
+	begin, end := p.Window()
+	e := w.journal.Get(p.PostingNumber)
+	e.SeenAt, e.OrderNumber, e.Products, e.Status = now, p.OrderNumber, productsText(p), p.Status
+	e.Created, e.WindowBegin, e.WindowEnd = p.InProcessAt.Time, begin, end
+	if strings.HasPrefix(e.LastError, "не удалось получить заказ") {
+		e.LastError = ""
+	}
+	w.journal.MarkDirty()
+
+	rs, ok, final := realStage(p)
+	if ok && rs > e.Stage {
+		e.Stage = rs
+	}
+	if final != "" {
+		if e.Final == "" {
+			e.Final, e.FinalAt = final, now
+			if final == "отменён" || final == "арбитраж" {
+				w.log.Add("warn", "Заказ %s: %s в Ozon, программа его больше не трогает.", p.PostingNumber, final)
+			}
+		}
+		return pendingAction{}, false
+	}
+	if !ok && e.Stage >= StageDelivering {
+		// Незнакомый статус у заказа, который программа уже вела (например, так Ozon показывает
+		// «курьер в пути»): продолжаем по журналу, чтобы не пропустить «Условно доставлен».
+		ok, rs = true, e.Stage
+	}
+	if !ok {
+		e.Warning = "статус Ozon «" + p.Status + "» — программа такой заказ не трогает"
+		e.DueAt = time.Time{}
+		w.logOnce("unknown|"+p.PostingNumber+"|"+p.Status, "warn", "Заказ %s: %s.", p.PostingNumber, e.Warning)
+		return pendingAction{}, false
+	}
+	if e.Stage >= StageDelivered {
+		if e.Final == "" {
+			e.Final, e.FinalAt = "условно доставлен", now
+		}
+		return pendingAction{}, false
+	}
+	w.logOnce("found|"+p.PostingNumber, "info", "Найден целевой заказ %s (%s), статус Ozon: %s, окно доставки: %s.",
+		p.PostingNumber, productsText(p), p.Status, fmtWindow(begin, end))
+
+	next := e.Stage + 1
+	due, warn := w.dueFor(next, e, now)
+	e.DueAt, e.Warning = due, warn
+	if warn != "" {
+		w.logOnce("nowindow|"+p.PostingNumber, "warn", "Заказ %s: %s.", p.PostingNumber, warn)
+	} else if !w.prof.Live && e.Stage > rs {
+		e.Warning = "этапы после «" + stageNames[rs] + "» выполнены только в тесте"
+	}
+	if due.IsZero() || due.After(now) || now.Before(e.NextTry) {
+		return pendingAction{}, false
+	}
+	if next == StageDelivered && !end.IsZero() && now.After(end) {
+		w.logOnce("late|"+p.PostingNumber, "warn", "Заказ %s: окно доставки уже закончилось (%s), перевожу в «Условно доставлен» сразу.",
+			p.PostingNumber, end.Local().Format("02.01 15:04"))
+	}
+	return pendingAction{p: p, e: e, next: next}, true
+}
+
 // dueFor — когда можно выполнить шаг next.
-func (w *Worker) dueFor(next int, e *JEntry, end time.Time, now time.Time) (time.Time, string) {
+func (w *Worker) dueFor(next int, e *JEntry, now time.Time) (time.Time, string) {
 	pause := time.Duration(w.prof.PauseSec) * time.Second
-	last := e.LastActionAt()
 	earliest := now
-	if !last.IsZero() {
+	if last := e.LastActionAt(); !last.IsZero() && last.Add(pause).After(now) {
 		earliest = last.Add(pause)
 	}
 	if next < StageDelivered {
 		return earliest, ""
 	}
-	if end.IsZero() {
-		return time.Time{}, "Ozon не вернул окно доставки — перевод в «Условно доставлен» не запланирован"
+	if e.WindowEnd.IsZero() {
+		return time.Time{}, "Ozon не вернул окно доставки — «Условно доставлен» не запланирован, переведите вручную"
 	}
-	target := end.Add(-time.Duration(w.prof.MarginMin) * time.Minute)
+	target := e.WindowEnd.Add(-time.Duration(w.prof.MarginMin) * time.Minute)
 	if target.Before(earliest) {
 		target = earliest
 	}
 	return target, ""
 }
 
-func (w *Worker) process(ctx context.Context, p *Posting, now time.Time) (PostingView, time.Time) {
-	begin, end := p.Window()
-	v := PostingView{PostingNumber: p.PostingNumber, OrderNumber: p.OrderNumber, Created: p.InProcessAt.Time,
-		Status: p.Status, Substatus: p.Substatus, WindowBegin: begin, WindowEnd: end}
-	e := w.journal.Get(p.PostingNumber)
-	e.SeenAt = now
-	rs, ok, final := realStage(p)
-	stage := e.Stage
-	if ok && rs > stage {
-		stage = rs
+// execute выполняет накопленные шаги: «Собрать» — по одному, смену статусов — пачками.
+func (w *Worker) execute(ctx context.Context, pend []pendingAction, now time.Time) {
+	if len(pend) == 0 {
+		return
 	}
-	if e.Stage < 0 && ok && final == "" {
-		w.logOnce(p.PostingNumber, "found", "info", "Найден целевой заказ %s (%s), статус Ozon: %s, окно доставки: %s.",
-			p.PostingNumber, productsText(p), p.Status, fmtWindow(begin, end))
-	}
-	if stage > e.Stage && ok {
-		e.Stage = stage
-	}
-	v.Stage = stage
-	for i := 0; i <= StageDelivered; i++ {
-		v.Done[i] = i <= stage && stage >= 0
-		v.Plan[i] = e.DoneAt[i]
-	}
-	v.Error = e.LastError
-	if !w.prof.Live && final == "" && e.Stage > rs && rs >= 0 {
-		v.Warning = "Этапы после «" + stageNames[rs] + "» выполнены только в тесте"
-	}
-
-	if final != "" || !ok || stage >= StageDelivered {
-		if final == "" && !ok {
-			final = "статус " + p.Status
+	sort.Slice(pend, func(i, j int) bool { // сначала самые срочные
+		if pend[i].next != pend[j].next {
+			return pend[i].next > pend[j].next
 		}
-		if final == "" {
-			final = "условно доставлен"
+		return pend[i].e.DueAt.Before(pend[j].e.DueAt)
+	})
+	if !w.prof.Live {
+		for _, a := range pend {
+			w.log.Add("test", "[ТЕСТ] Заказ %s: «%s» — сделал бы запрос %s. В Ozon ничего не отправлено.", a.p.PostingNumber, actionNames[a.next], actionPaths[a.next])
+			w.markDone(a, now)
 		}
-		v.Final = final
-		return v, time.Time{}
+		return
 	}
-
-	next := stage + 1
-	due, warn := w.dueFor(next, e, end, now)
-	if warn != "" {
-		v.Warning = warn
-		w.logOnce(p.PostingNumber, "nowindow", "warn", "Заказ %s: %s.", p.PostingNumber, warn)
+	// Сначала самые срочные шаги («Условно доставлен» привязан к концу окна), «Собрать» — в конце.
+	groups := map[int][]pendingAction{}
+	for _, a := range pend {
+		groups[a.next] = append(groups[a.next], a)
 	}
-	if !due.IsZero() && !due.After(now) {
-		if next == StageDelivered && !end.IsZero() && now.After(end) {
-			w.logOnce(p.PostingNumber, "late", "warn", "Заказ %s: окно доставки уже закончилось (%s), перевожу в «Условно доставлен» сразу.",
-				p.PostingNumber, end.Local().Format("02.01 15:04"))
-		}
-		err := w.act(ctx, p, e, next, now)
-		if err == nil {
-			stage = next
-			v.Stage, v.Done[next], v.Plan[next], v.Error = stage, true, now, ""
-			if stage >= StageDelivered {
-				v.Final = "условно доставлен"
-				return v, time.Time{}
+	for _, next := range []int{StageDelivered, StageLastMile, StageDelivering} {
+		list := groups[next]
+		for i := 0; i < len(list); i += batchSize {
+			if ctx.Err() != nil {
+				return
 			}
-			next = stage + 1
-			due, _ = w.dueFor(next, e, end, now)
-		} else {
-			v.Error = e.LastError
-			due = now.Add(time.Duration(w.prof.PollSec) * time.Second)
-		}
-	}
-	// план для оставшихся шагов
-	t := due
-	pause := time.Duration(w.prof.PauseSec) * time.Second
-	for i := next; i <= StageDelivered && !t.IsZero(); i++ {
-		if i == StageDelivered && !end.IsZero() {
-			if dt := end.Add(-time.Duration(w.prof.MarginMin) * time.Minute); dt.After(t) {
-				t = dt
+			chunk := list[i:min(i+batchSize, len(list))]
+			pns := make([]string, len(chunk))
+			for k, a := range chunk {
+				pns[k] = a.p.PostingNumber
+			}
+			res, err := w.client.SetStatusBatch(ctx, actionPaths[next], pns)
+			for _, a := range chunk {
+				if err != nil {
+					w.result(a, err, now)
+				} else {
+					w.result(a, res[a.p.PostingNumber], now)
+				}
 			}
 		}
-		v.Plan[i] = t
-		t = t.Add(pause)
 	}
-	v.NextAction = actionNames[next]
-	v.NextAt = due
-	return v, due
+	for _, a := range groups[StageShipped] {
+		if ctx.Err() != nil {
+			return
+		}
+		w.result(a, w.client.Ship(ctx, a.p), now)
+	}
 }
 
-func (w *Worker) act(ctx context.Context, p *Posting, e *JEntry, next int, now time.Time) error {
-	name := actionNames[next]
-	if !w.prof.Live {
-		w.log.Add("test", "[ТЕСТ] Заказ %s: «%s» — сделал бы запрос %s. В Ozon ничего не отправлено.", p.PostingNumber, name, actionPaths[next])
-		e.Stage, e.DoneAt[next], e.Fails, e.LastError = next, now, 0, ""
-		return nil
-	}
-	var err error
-	if next == StageShipped {
-		err = w.client.Ship(ctx, p)
+func (w *Worker) markDone(a pendingAction, now time.Time) {
+	e := a.e
+	e.Stage, e.DoneAt[a.next], e.Fails, e.LastError, e.NextTry = a.next, now, 0, "", time.Time{}
+	if a.next >= StageDelivered {
+		e.Final, e.FinalAt, e.DueAt = "условно доставлен", now, time.Time{}
 	} else {
-		err = w.client.SetStatus(ctx, actionPaths[next], p.PostingNumber)
+		e.DueAt, _ = w.dueFor(a.next+1, e, now)
 	}
-	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			return err
-		}
-		e.Fails++
-		e.LastError = fmt.Sprintf("«%s»: %v", name, err)
-		w.log.Add("err", "Заказ %s: не удалось «%s» (попытка %d): %v", p.PostingNumber, name, e.Fails, err)
-		// Если «Курьер в пути» стабильно не принимается (например, уже выставлен вручную), идём дальше.
-		if next == StageLastMile && e.Fails >= 3 {
-			w.log.Add("warn", "Заказ %s: считаю этап «Курьер в пути» выполненным и перехожу к ожиданию конца окна.", p.PostingNumber)
-			e.Stage, e.DoneAt[next], e.Fails = next, now, 0
-		}
-		return err
+	w.journal.MarkDirty()
+}
+
+func (w *Worker) result(a pendingAction, err error, now time.Time) {
+	name := actionNames[a.next]
+	if err == nil {
+		w.markDone(a, now)
+		w.log.Add("ok", "Заказ %s: «%s» — выполнено.", a.p.PostingNumber, name)
+		return
 	}
-	e.Stage, e.DoneAt[next], e.Fails, e.LastError = next, now, 0, ""
-	w.log.Add("ok", "Заказ %s: «%s» — выполнено.", p.PostingNumber, name)
-	return nil
+	if errors.Is(err, context.Canceled) {
+		return
+	}
+	e := a.e
+	e.Fails++
+	e.LastError = fmt.Sprintf("«%s»: %v", name, err)
+	e.NextTry = now.Add(retryDelay(e.Fails))
+	w.journal.MarkDirty()
+	w.log.Add("err", "Заказ %s: не удалось «%s» (попытка %d, повтор через %s): %v", a.p.PostingNumber, name, e.Fails,
+		e.NextTry.Sub(now).Round(time.Second), err)
+	// Если «Курьер в пути» стабильно не принимается (например, уже выставлен вручную), идём дальше.
+	if a.next == StageLastMile && e.Fails >= 3 {
+		w.log.Add("warn", "Заказ %s: считаю этап «Курьер в пути» выполненным и перехожу к ожиданию конца окна.", a.p.PostingNumber)
+		w.markDone(a, now)
+	}
+}
+
+// buildViews — таблица для интерфейса из журнала и время ближайшего дела.
+func (w *Worker) buildViews(now time.Time) ([]PostingView, time.Time) {
+	var views []PostingView
+	var nextDue time.Time
+	pause := time.Duration(w.prof.PauseSec) * time.Second
+	for _, e := range w.journal.All() {
+		if e.Final != "" {
+			if now.Sub(e.FinalAt) > 24*time.Hour {
+				continue
+			}
+		} else if e.Stage < 0 && e.Warning == "" || now.Sub(e.SeenAt) > 3*24*time.Hour {
+			continue
+		}
+		v := PostingView{PostingNumber: e.PostingNumber, OrderNumber: e.OrderNumber, Created: e.Created, Status: e.Status,
+			Stage: e.Stage, Final: e.Final, WindowBegin: e.WindowBegin, WindowEnd: e.WindowEnd, Warning: e.Warning, Error: e.LastError}
+		for i := 0; i <= StageDelivered; i++ {
+			v.Done[i] = e.Stage >= 0 && i <= e.Stage
+			v.Plan[i] = e.DoneAt[i]
+		}
+		if e.Final == "" && e.Stage >= 0 && e.Stage < StageDelivered {
+			due := e.DueAt
+			if e.NextTry.After(due) && !due.IsZero() {
+				due = e.NextTry
+			}
+			v.NextAction, v.NextAt = actionNames[e.Stage+1], due
+			// план оставшихся шагов
+			t := due
+			for i := e.Stage + 1; i <= StageDelivered && !t.IsZero(); i++ {
+				if i == StageDelivered && !e.WindowEnd.IsZero() {
+					if dt := e.WindowEnd.Add(-time.Duration(w.prof.MarginMin) * time.Minute); dt.After(t) {
+						t = dt
+					}
+				}
+				v.Plan[i] = t
+				t = t.Add(pause)
+			}
+			if !due.IsZero() && (nextDue.IsZero() || due.Before(nextDue)) {
+				nextDue = due
+			}
+		}
+		views = append(views, v)
+	}
+	sort.Slice(views, func(i, j int) bool {
+		fi, fj := views[i].Final != "", views[j].Final != ""
+		if fi != fj {
+			return !fi
+		}
+		if !fi {
+			return views[i].NextAt.Before(views[j].NextAt)
+		}
+		return views[i].Created.After(views[j].Created)
+	})
+	if len(views) > 300 {
+		views = views[:300]
+	}
+	return views, nextDue
 }
 
 func fmtWindow(b, e time.Time) string {
@@ -443,6 +628,7 @@ type Manager struct {
 	dir     string
 	store   *Store
 	mocks   *MockRegistry
+	opMu    sync.Mutex // запуск/остановка — по одному
 	mu      sync.Mutex
 	workers map[string]*Worker
 	logs    map[string]*ShopLog
@@ -472,6 +658,13 @@ func (m *Manager) journalPath(p *Profile) string {
 }
 
 func (m *Manager) Start(id string) error {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+	return m.start(id)
+}
+
+// start/stop вызываются под opMu: два одновременных запуска не создадут двух работников на один магазин.
+func (m *Manager) start(id string) error {
 	p, ok := m.store.Get(id)
 	if !ok {
 		return fmt.Errorf("магазин не найден")
@@ -479,17 +672,24 @@ func (m *Manager) Start(id string) error {
 	if err := p.Validate(); err != nil {
 		return err
 	}
-	m.Stop(id, false)
+	m.stop(id, false)
 	w := NewWorker(p, NewClient(&p, m.mocks), LoadJournal(m.journalPath(&p)), m.Log(id))
 	m.mu.Lock()
 	m.workers[id] = w
 	m.mu.Unlock()
 	w.Start()
 	m.store.Update(id, func(pp *Profile) { pp.Running = true })
+	m.updateAwake()
 	return nil
 }
 
 func (m *Manager) Stop(id string, persist bool) {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+	m.stop(id, persist)
+}
+
+func (m *Manager) stop(id string, persist bool) {
 	m.mu.Lock()
 	w := m.workers[id]
 	delete(m.workers, id)
@@ -500,9 +700,20 @@ func (m *Manager) Stop(id string, persist bool) {
 	if persist {
 		m.store.Update(id, func(pp *Profile) { pp.Running = false })
 	}
+	m.updateAwake()
+}
+
+// updateAwake не даёт Windows уснуть, пока работает автоматизация хотя бы одного магазина.
+func (m *Manager) updateAwake() {
+	m.mu.Lock()
+	n := len(m.workers)
+	m.mu.Unlock()
+	keepAwake(n > 0)
 }
 
 func (m *Manager) StopAll() {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
 	m.mu.Lock()
 	var ws []*Worker
 	for _, w := range m.workers {
@@ -548,14 +759,16 @@ func (m *Manager) ResetTest(id string) error {
 	}
 	tp := p
 	tp.Live = false
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
 	running := m.IsRunning(id) && !p.Live
 	if running {
-		m.Stop(id, false)
+		m.stop(id, false)
 	}
 	err := LoadJournal(m.journalPath(&tp)).Reset()
 	m.Log(id).Add("info", "Журнал тестового прогона очищен.")
 	if running {
-		return m.Start(id)
+		return m.start(id)
 	}
 	return err
 }

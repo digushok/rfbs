@@ -238,7 +238,20 @@ type JEntry struct {
 	DoneAt        [5]time.Time `json:"done_at"` // когда программа выполнила этап
 	Fails         int          `json:"fails"`
 	LastError     string       `json:"last_error,omitempty"`
-	SeenAt        time.Time    `json:"seen_at"`
+	NextTry       time.Time    `json:"next_try"` // после ошибки — не раньше этого времени
+	DueAt         time.Time    `json:"due_at"`   // когда запланирован следующий шаг
+	Warning       string       `json:"warning,omitempty"`
+	Final         string       `json:"final,omitempty"` // заказ завершён: доставлен, отменён...
+	FinalAt       time.Time    `json:"final_at"`
+	SeenAt        time.Time    `json:"seen_at"` // когда последний раз получали данные из Ozon
+
+	// Сведения для отображения (последние данные из Ozon).
+	OrderNumber string    `json:"order_number,omitempty"`
+	Products    string    `json:"products,omitempty"`
+	Status      string    `json:"status,omitempty"`
+	Created     time.Time `json:"created"`
+	WindowBegin time.Time `json:"window_begin"`
+	WindowEnd   time.Time `json:"window_end"`
 }
 
 func (e *JEntry) LastActionAt() time.Time {
@@ -254,6 +267,7 @@ func (e *JEntry) LastActionAt() time.Time {
 type Journal struct {
 	path    string
 	mu      sync.Mutex
+	dirty   bool
 	Entries map[string]*JEntry `json:"entries"`
 }
 
@@ -268,6 +282,7 @@ func LoadJournal(path string) *Journal {
 	return j
 }
 
+// Get возвращает запись (создаёт новую). Изменения записей сохраняются при Save после MarkDirty.
 func (j *Journal) Get(pn string) *JEntry {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -275,26 +290,58 @@ func (j *Journal) Get(pn string) *JEntry {
 	if e == nil {
 		e = &JEntry{PostingNumber: pn, Stage: -1}
 		j.Entries[pn] = e
+		j.dirty = true
 	}
 	return e
 }
 
+func (j *Journal) Peek(pn string) *JEntry {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.Entries[pn]
+}
+
+func (j *Journal) All() []*JEntry {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	out := make([]*JEntry, 0, len(j.Entries))
+	for _, e := range j.Entries {
+		out = append(out, e)
+	}
+	return out
+}
+
+func (j *Journal) MarkDirty() {
+	j.mu.Lock()
+	j.dirty = true
+	j.mu.Unlock()
+}
+
+// Save записывает журнал на диск, если он менялся. Старые завершённые заказы удаляются.
 func (j *Journal) Save() error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	cut := time.Now().Add(-45 * 24 * time.Hour)
+	if !j.dirty {
+		return nil
+	}
+	now := time.Now()
 	for k, e := range j.Entries {
-		if !e.SeenAt.IsZero() && e.SeenAt.Before(cut) {
+		if (e.Final != "" && now.Sub(e.FinalAt) > 7*24*time.Hour) || (!e.SeenAt.IsZero() && now.Sub(e.SeenAt) > 45*24*time.Hour) {
 			delete(j.Entries, k)
 		}
 	}
-	b, _ := json.MarshalIndent(j, "", " ")
-	return writeFileAtomic(j.path, b)
+	b, _ := json.Marshal(j)
+	if err := writeFileAtomic(j.path, b); err != nil {
+		return err
+	}
+	j.dirty = false
+	return nil
 }
 
 func (j *Journal) Reset() error {
 	j.mu.Lock()
 	j.Entries = map[string]*JEntry{}
+	j.dirty = true
 	j.mu.Unlock()
 	return j.Save()
 }
@@ -327,6 +374,12 @@ func (l *ShopLog) Add(level, format string, args ...any) {
 	l.lines = append(l.lines, ln)
 	if len(l.lines) > 3000 {
 		l.lines = l.lines[len(l.lines)-2000:]
+	}
+	if l.seq%200 == 0 {
+		if st, err := os.Stat(l.file); err == nil && st.Size() > 10<<20 {
+			os.Remove(l.file + ".old")
+			os.Rename(l.file, l.file+".old")
+		}
 	}
 	if f, err := os.OpenFile(l.file, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
 		fmt.Fprintf(f, "%s [%s] %s\n", ln.Time.Format("2006-01-02 15:04:05"), level, ln.Text)

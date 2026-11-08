@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -53,6 +54,38 @@ type Client struct {
 	apiKey   string
 	http     *http.Client
 	readOnly bool
+
+	offsetMu sync.Mutex
+	offset   time.Duration // часы Ozon минус часы компьютера
+	hasOff   bool
+}
+
+// ClockOffset — насколько часы Ozon впереди часов компьютера (по заголовку Date).
+func (c *Client) ClockOffset() (time.Duration, bool) {
+	c.offsetMu.Lock()
+	defer c.offsetMu.Unlock()
+	return c.offset, c.hasOff
+}
+
+func (c *Client) noteDate(h string, sent, got time.Time) {
+	if h == "" {
+		return
+	}
+	t, err := http.ParseTime(h)
+	if err != nil {
+		return
+	}
+	// Date с точностью до секунды: берём середину запроса и +0,5 с на округление.
+	local := sent.Add(got.Sub(sent) / 2)
+	off := t.Add(500 * time.Millisecond).Sub(local)
+	c.offsetMu.Lock()
+	if !c.hasOff {
+		c.offset = off
+	} else {
+		c.offset = (c.offset*3 + off) / 4
+	}
+	c.hasOff = true
+	c.offsetMu.Unlock()
 }
 
 func NewClient(p *Profile, mocks *MockRegistry) *Client {
@@ -89,7 +122,11 @@ func (c *Client) call(ctx context.Context, path string, req any, out any) error 
 		r.Header.Set("Client-Id", c.clientID)
 		r.Header.Set("Api-Key", c.apiKey)
 		r.Header.Set("Content-Type", "application/json")
+		sent := time.Now()
 		resp, err := c.http.Do(r)
+		if err == nil {
+			c.noteDate(resp.Header.Get("Date"), sent, time.Now())
+		}
 		if err != nil {
 			lastErr = fmt.Errorf("сеть: %w", err)
 			if ctx.Err() != nil {
@@ -210,16 +247,17 @@ func (p *Posting) Window() (begin, end time.Time) {
 	return p.AnalyticsData.DeliveryDateBegin.Time, p.AnalyticsData.DeliveryDateEnd.Time
 }
 
-// ListPostings — все FBS/rFBS-отправления склада за период (по дате создания).
-func (c *Client) ListPostings(ctx context.Context, warehouseID int64, since, to time.Time) ([]Posting, error) {
+// ListPostings — отправления склада в указанном статусе, созданные за период.
+func (c *Client) ListPostings(ctx context.Context, warehouseID int64, status string, since, to time.Time) ([]Posting, error) {
 	var all []Posting
 	offset := 0
-	for page := 0; page < 30; page++ {
+	for {
 		req := map[string]any{
 			"dir": "ASC",
 			"filter": map[string]any{
 				"since":        since.UTC().Format(time.RFC3339),
 				"to":           to.UTC().Format(time.RFC3339),
+				"status":       status,
 				"warehouse_id": []int64{warehouseID},
 			},
 			"limit":  1000,
@@ -237,11 +275,28 @@ func (c *Client) ListPostings(ctx context.Context, warehouseID int64, since, to 
 		}
 		all = append(all, resp.Result.Postings...)
 		if !resp.Result.HasNext || len(resp.Result.Postings) == 0 {
-			break
+			return all, nil
 		}
 		offset += len(resp.Result.Postings)
+		if offset >= 20000 {
+			return all, fmt.Errorf("в статусе %s больше %d отправлений — список неполный", status, offset)
+		}
 	}
-	return all, nil
+}
+
+// GetPosting — одно отправление по номеру.
+func (c *Client) GetPosting(ctx context.Context, pn string) (*Posting, error) {
+	req := map[string]any{"posting_number": pn, "with": map[string]any{"analytics_data": true}}
+	var resp struct {
+		Result Posting `json:"result"`
+	}
+	if err := c.call(ctx, "/v3/posting/fbs/get", req, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Result.PostingNumber == "" {
+		return nil, fmt.Errorf("отправление %s не найдено", pn)
+	}
+	return &resp.Result, nil
 }
 
 // Ship — «Собрать»: одна коробка со всеми товарами отправления. Статус → awaiting_deliver.
@@ -261,9 +316,19 @@ func (c *Client) Ship(ctx context.Context, p *Posting) error {
 	return c.call(ctx, "/v4/posting/fbs/ship", req, &resp)
 }
 
-// SetStatus — «Доставляется» / «Курьер в пути» / «Доставлено».
+// SetStatus — «Доставляется» / «Курьер в пути» / «Доставлено» для одного отправления.
 func (c *Client) SetStatus(ctx context.Context, path, postingNumber string) error {
-	req := map[string]any{"posting_number": []string{postingNumber}}
+	res, err := c.SetStatusBatch(ctx, path, []string{postingNumber})
+	if err != nil {
+		return err
+	}
+	return res[postingNumber]
+}
+
+// SetStatusBatch — смена статуса сразу нескольким отправлениям.
+// Возвращает ошибку по каждому номеру (nil — успешно) или общую ошибку запроса.
+func (c *Client) SetStatusBatch(ctx context.Context, path string, pns []string) (map[string]error, error) {
+	req := map[string]any{"posting_number": pns}
 	var resp struct {
 		Result []struct {
 			PostingNumber string          `json:"posting_number"`
@@ -272,21 +337,31 @@ func (c *Client) SetStatus(ctx context.Context, path, postingNumber string) erro
 		} `json:"result"`
 	}
 	if err := c.call(ctx, path, req, &resp); err != nil {
-		return err
+		return nil, err
+	}
+	out := map[string]error{}
+	for _, pn := range pns {
+		out[pn] = &OzonError{Status: 200, Path: path, Message: "Ozon не вернул результат по отправлению"}
 	}
 	for _, r := range resp.Result {
-		if r.PostingNumber != "" && r.PostingNumber != postingNumber {
+		pn := r.PostingNumber
+		if pn == "" && len(pns) == 1 {
+			pn = pns[0]
+		}
+		if _, ok := out[pn]; !ok {
 			continue
 		}
-		if !r.Result {
-			msg := strings.Trim(string(r.Error), `[]"`)
-			if msg == "" || msg == "null" {
-				msg = "Ozon не подтвердил смену статуса"
-			}
-			return &OzonError{Status: 200, Path: path, Message: msg}
+		if r.Result {
+			out[pn] = nil
+			continue
 		}
+		msg := strings.Trim(string(r.Error), `[]"`)
+		if msg == "" || msg == "null" {
+			msg = "Ozon не подтвердил смену статуса"
+		}
+		out[pn] = &OzonError{Status: 200, Path: path, Message: msg}
 	}
-	return nil
+	return out, nil
 }
 
 // ---------- склады ----------
