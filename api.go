@@ -123,7 +123,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 				cur = &profileOut{Profile: p, APIKeySet: p.APIKey != ""}
 			}
 		}
-		return map[string]any{"version": appVersion, "data_dir": s.dir, "active": active, "shops": shops, "profile": cur}, nil
+		return map[string]any{"version": appVersion, "repo": repoURL, "data_dir": s.dir, "active": active, "shops": shops, "profile": cur}, nil
 	})
 
 	s.handle(mux, "/api/profile/save", func(r *http.Request, b map[string]any) (any, error) {
@@ -356,6 +356,10 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			lines = []LogLine{}
 		}
 		return map[string]any{"lines": lines}, nil
+	})
+
+	s.handle(mux, "/api/update", func(r *http.Request, b map[string]any) (any, error) {
+		return checkUpdate()
 	})
 
 	s.handle(mux, "/api/open-dir", func(r *http.Request, b map[string]any) (any, error) {

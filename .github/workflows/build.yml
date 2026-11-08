@@ -1,21 +1,54 @@
 name: build
 
+# При каждом пуше: тесты и сборка .exe (артефакт).
+# В основной ветке: если релиза с версией из файла VERSION ещё нет — публикуется релиз с .exe.
+
 on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
-  windows-exe:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-      - run: go vet ./...
-      - run: go test ./...
-      - run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-H windowsgui -s -w" -o OzonRFBS.exe .
+
+      - name: Проверки и тесты
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: Версия
+        run: echo "VERSION=$(tr -d ' \r\n' < VERSION)" >> "$GITHUB_ENV"
+
+      - name: Сборка OzonRFBS.exe
+        run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-H windowsgui -s -w -X main.appVersion=${VERSION}" -o OzonRFBS.exe .
+
       - uses: actions/upload-artifact@v4
         with:
-          name: OzonRFBS-windows
+          name: OzonRFBS-${{ env.VERSION }}-windows
           path: OzonRFBS.exe
+
+      - name: Релиз на GitHub
+        if: github.ref_name == github.event.repository.default_branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${VERSION}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Релиз $TAG уже есть — чтобы выпустить новый, поднимите версию в файле VERSION."
+            exit 0
+          fi
+          awk -v v="$VERSION" '/^## /{p = index($0, v) > 0; next} p' CHANGELOG.md > notes.md
+          {
+            echo
+            echo "**Как обновиться:** закройте программу (⏻), замените OzonRFBS.exe на новый и запустите. Настройки и ключи сохраняются."
+          } >> notes.md
+          gh release create "$TAG" OzonRFBS.exe --target "$GITHUB_SHA" --title "Ozon rFBS $TAG" --notes-file notes.md --latest

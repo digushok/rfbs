@@ -16,7 +16,10 @@ import (
 	"time"
 )
 
-const appVersion = "1.0.0"
+// Версию подставляет сборка из файла VERSION: -ldflags "-X main.appVersion=..."
+var appVersion = "dev"
+
+const repoURL = "https://github.com/digushok/rfbs"
 
 //go:embed static
 var staticFS embed.FS

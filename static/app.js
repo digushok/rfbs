@@ -55,6 +55,8 @@ async function loadState(full = true) {
   sel.value = j.active;
   $('#verFoot').textContent = 'Ozon rFBS · версия ' + j.version;
   $('#dataDir').textContent = j.data_dir;
+  $('#aboutSub').textContent = 'Версия ' + j.version + ' · обновления выходят на GitHub в разделе Releases';
+  $('#relLink').href = j.repo + '/releases';
   renderProfile(full);
   renderShops();
 }
@@ -292,6 +294,15 @@ $('#sShops').onclick = async e => {
     if (!(await confirmBox(`<h3>Удалить магазин «${esc(s.name)}»?</h3><p>Ключи и настройки этого магазина будут удалены с компьютера.</p>`, 'Удалить'))) return;
     await api('/api/profile/delete', { id: del }); await loadState(); refreshRun(); refreshLog();
   }
+};
+$('#updCheck').onclick = async () => {
+  const box = $('#updRes'); box.innerHTML = '<div>Проверяю…</div>';
+  try {
+    const j = await api('/api/update');
+    box.innerHTML = j.newer
+      ? `<div class="ok">Доступна версия <b>${esc(j.latest)}</b> (у вас ${esc(j.current)}). ${j.download ? `<a href="${esc(j.download)}">Скачать .exe</a> · ` : ''}<a href="${esc(j.url)}" target="_blank" rel="noopener">что нового</a><br><span class="small">Закройте программу (⏻), замените файл .exe на новый и запустите. Настройки сохранятся.</span></div>`
+      : `<div>У вас последняя версия (${esc(j.current)}).</div>`;
+  } catch (e) { box.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
 };
 $('#dOpen').onclick = () => api('/api/open-dir', {});
 

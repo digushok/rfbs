@@ -202,3 +202,15 @@ func TestStockApply(t *testing.T) {
 		t.Fatalf("остатки не выставлены: %v", m.stock)
 	}
 }
+
+func TestVersionLess(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{{"1.0.0", "1.0.1", true}, {"1.2.0", "1.10.0", true}, {"1.0.0", "1.0.0", false}, {"2.0.0", "1.9.9", false}, {"dev", "1.0.0", true}}
+	for _, c := range cases {
+		if got := versionLess(c.a, c.b); got != c.want {
+			t.Errorf("%s < %s: ожидали %v", c.a, c.b, c.want)
+		}
+	}
+}

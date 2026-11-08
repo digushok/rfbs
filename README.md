@@ -18,6 +18,12 @@
 
 Остальные заказы программа не трогает. Они видны в блоке «Пропущенные заказы» с причиной. Отменённые заказы и заказы в арбитраже тоже не трогаются.
 
+## Скачать
+
+**Последняя версия:** [OzonRFBS.exe](https://github.com/digushok/rfbs/releases/latest/download/OzonRFBS.exe). Все версии и что в них нового — в разделе [Releases](https://github.com/digushok/rfbs/releases).
+
+Обновление: закройте программу (⏻), замените `OzonRFBS.exe` на новый и запустите. Настройки и ключи сохраняются. Проверить, есть ли новая версия, можно в самой программе: «Настройки → О программе → Проверить обновления».
+
 ## Установка и запуск
 
 1. Скопируйте `OzonRFBS.exe` в любую папку и запустите. Откроется окно программы в браузере, адрес `http://127.0.0.1:8766`.
@@ -88,7 +94,7 @@
 Нужен Go 1.22+:
 
 ```bash
-GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-H windowsgui -s -w" -o OzonRFBS.exe .
+GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-H windowsgui -s -w -X main.appVersion=$(cat VERSION)" -o OzonRFBS.exe .
 ```
 
 Тесты:
@@ -97,7 +103,12 @@ GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-H windowsgui -s -w" -o O
 go test ./...
 ```
 
-GitHub Actions собирает `.exe` при каждом пуше: вкладка Actions → сборка → артефакт `OzonRFBS-windows`.
+## Версии и релизы
+
+- Номер версии хранится в файле `VERSION`, список изменений — в `CHANGELOG.md`.
+- При каждом пуше GitHub Actions прогоняет тесты и собирает `.exe`.
+- В основной ветке, если релиза с такой версией ещё нет, он публикуется автоматически: тег `vX.Y.Z` и файл `OzonRFBS.exe`.
+- Как выпустить новую версию: поднимите номер в `VERSION` (например, `1.0.1` — исправления, `1.1.0` — новые возможности), добавьте раздел в `CHANGELOG.md` и запушьте.
 
 Структура:
 
