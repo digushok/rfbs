@@ -109,12 +109,7 @@ func (m *MockOzon) AddPosting(kind string) *Posting {
 	for _, pr := range p.Products {
 		m.stock[pr.SKU] -= pr.Quantity
 	}
-	p.AnalyticsData = &struct {
-		DeliveryDateBegin OTime  `json:"delivery_date_begin"`
-		DeliveryDateEnd   OTime  `json:"delivery_date_end"`
-		WarehouseID       int64  `json:"warehouse_id"`
-		City              string `json:"city"`
-	}{WarehouseID: p.DeliveryMethod.WarehouseID, City: "Москва"}
+	p.AnalyticsData = &AnalyticsData{WarehouseID: p.DeliveryMethod.WarehouseID, City: "Москва"}
 	p.AnalyticsData.DeliveryDateBegin.Time = now.Add(m.WindowStart).Truncate(time.Minute)
 	p.AnalyticsData.DeliveryDateEnd.Time = now.Add(m.WindowEnd).Truncate(time.Minute)
 	if m.WindowFn != nil {
@@ -168,11 +163,11 @@ func (m *MockOzon) Handle(path string, body []byte) (int, any) {
 	switch path {
 	case "/v1/roles":
 		return 200, map[string]any{"roles": []any{
-			map[string]any{"name": "Posting FBS", "methods": []string{"/v3/posting/fbs/list", "/v4/posting/fbs/ship", "/v2/fbs/posting/delivering", "/v2/fbs/posting/last-mile", "/v2/fbs/posting/delivered"}},
-			map[string]any{"name": "Stocks", "methods": []string{"/v2/products/stocks", "/v1/product/info/stocks-by-warehouse/fbs", "/v1/warehouse/list"}},
+			map[string]any{"name": "Posting FBS", "methods": []string{"/v4/posting/fbs/list", "/v3/posting/fbs/get", "/v4/posting/fbs/ship", "/v2/fbs/posting/delivering", "/v2/fbs/posting/last-mile", "/v2/fbs/posting/delivered"}},
+			map[string]any{"name": "Stocks", "methods": []string{"/v2/products/stocks", "/v2/product/info/stocks-by-warehouse/fbs", "/v2/warehouse/list"}},
 			map[string]any{"name": "Product read-only", "methods": []string{"/v3/product/info/list"}},
 		}}
-	case "/v1/warehouse/list":
+	case "/v2/warehouse/list":
 		return 200, map[string]any{"result": []any{
 			map[string]any{"warehouse_id": mockWarehouseID, "name": mockWarehouseName, "is_rfbs": true, "status": "created"},
 			map[string]any{"warehouse_id": mockWarehouseID + 1, "name": "Демо-склад FBS (Подольск)", "is_rfbs": false, "status": "created"},
@@ -188,7 +183,7 @@ func (m *MockOzon) Handle(path string, body []byte) (int, any) {
 				"sources": []any{map[string]any{"sku": pr.SKU, "source": "sds"}}})
 		}
 		return 200, map[string]any{"items": items}
-	case "/v1/product/info/stocks-by-warehouse/fbs":
+	case "/v2/product/info/stocks-by-warehouse/fbs":
 		var res []any
 		for _, s := range toIntList(req["sku"]) {
 			pr := m.prod(s)
@@ -229,33 +224,37 @@ func (m *MockOzon) Handle(path string, body []byte) (int, any) {
 			res = append(res, map[string]any{"product_id": pid, "offer_id": pr.OfferID, "warehouse_id": mockWarehouseID, "updated": true, "errors": []any{}})
 		}
 		return 200, map[string]any{"result": res}
-	case "/v3/posting/fbs/list":
+	case "/v4/posting/fbs/list":
 		f, _ := req["filter"].(map[string]any)
-		whs := toIntList(f["warehouse_id"])
-		status, _ := f["status"].(string)
-		limit, offset := int(toInt(req["limit"])), int(toInt(req["offset"]))
-		if limit <= 0 || limit > 1000 {
-			limit = 1000
+		if f == nil || f["since"] == nil || f["to"] == nil {
+			return errResp(400, "filter.since и filter.to обязательны")
 		}
+		whs := toIntList(f["warehouse_ids"])
+		statuses := toStrList(f["statuses"])
+		limit := int(toInt(req["limit"]))
+		if limit <= 0 || limit > 100 {
+			return errResp(400, "limit: от 1 до 100")
+		}
+		offset := int(toInt(req["cursor"]))
 		var out []*Posting
 		for _, p := range m.postings {
 			if len(whs) > 0 && whs[0] != p.DeliveryMethod.WarehouseID {
 				continue
 			}
-			if status != "" && p.Status != status {
+			if len(statuses) > 0 && !contains(statuses, p.Status) {
 				continue
 			}
 			out = append(out, p)
 		}
-		hasNext := false
 		if offset > len(out) {
 			offset = len(out)
 		}
 		out = out[offset:]
+		hasNext, cursor := false, ""
 		if len(out) > limit {
-			out, hasNext = out[:limit], true
+			out, hasNext, cursor = out[:limit], true, fmt.Sprint(offset+limit)
 		}
-		return 200, map[string]any{"result": map[string]any{"postings": out, "has_next": hasNext}}
+		return 200, map[string]any{"postings": out, "has_next": hasNext, "cursor": cursor}
 	case "/v3/posting/fbs/get":
 		pn, _ := req["posting_number"].(string)
 		p := m.find(pn)
@@ -309,6 +308,15 @@ func toIntList(v any) []int64 {
 		out = append(out, toInt(x))
 	}
 	return out
+}
+
+func contains(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }
 
 func toStrList(v any) []string {

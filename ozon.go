@@ -45,6 +45,9 @@ func (e *OzonError) Error() string {
 	if msg == "" {
 		msg = http.StatusText(e.Status)
 	}
+	if e.Status == 404 && strings.Contains(strings.ToLower(msg), "page not found") {
+		return fmt.Sprintf("Ozon %s: метод не найден (HTTP 404) — вероятно, Ozon его отключил, нужна новая версия программы", e.Path)
+	}
 	return fmt.Sprintf("Ozon %s: HTTP %d: %s", e.Path, e.Status, msg)
 }
 
@@ -232,54 +235,71 @@ type Posting struct {
 		Warehouse   string `json:"warehouse"`
 	} `json:"delivery_method"`
 	Products      []PostingProduct `json:"products"`
-	AnalyticsData *struct {
-		DeliveryDateBegin OTime  `json:"delivery_date_begin"`
-		DeliveryDateEnd   OTime  `json:"delivery_date_end"`
-		WarehouseID       int64  `json:"warehouse_id"`
-		City              string `json:"city"`
-	} `json:"analytics_data"`
+	AnalyticsData *AnalyticsData   `json:"analytics_data"`
+}
+
+type AnalyticsData struct {
+	DeliveryDateBegin       OTime  `json:"delivery_date_begin"`
+	DeliveryDateEnd         OTime  `json:"delivery_date_end"`
+	ClientDeliveryDateBegin OTime  `json:"client_delivery_date_begin"`
+	ClientDeliveryDateEnd   OTime  `json:"client_delivery_date_end"`
+	WarehouseID             int64  `json:"warehouse_id"`
+	City                    string `json:"city"`
 }
 
 func (p *Posting) Window() (begin, end time.Time) {
 	if p.AnalyticsData == nil {
 		return
 	}
-	return p.AnalyticsData.DeliveryDateBegin.Time, p.AnalyticsData.DeliveryDateEnd.Time
+	a := p.AnalyticsData
+	if a.DeliveryDateEnd.IsZero() && !a.ClientDeliveryDateEnd.IsZero() {
+		return a.ClientDeliveryDateBegin.Time, a.ClientDeliveryDateEnd.Time
+	}
+	return a.DeliveryDateBegin.Time, a.DeliveryDateEnd.Time
 }
 
-// ListPostings — отправления склада в указанном статусе, созданные за период.
+// ListPostings — отправления склада в указанном статусе, созданные за период (/v4/posting/fbs/list).
 func (c *Client) ListPostings(ctx context.Context, warehouseID int64, status string, since, to time.Time) ([]Posting, error) {
 	var all []Posting
-	offset := 0
+	cursor := ""
 	for {
 		req := map[string]any{
-			"dir": "ASC",
 			"filter": map[string]any{
-				"since":        since.UTC().Format(time.RFC3339),
-				"to":           to.UTC().Format(time.RFC3339),
-				"status":       status,
-				"warehouse_id": []int64{warehouseID},
+				"since":         since.UTC().Format(time.RFC3339),
+				"to":            to.UTC().Format(time.RFC3339),
+				"statuses":      []string{status},
+				"warehouse_ids": []string{strconv.FormatInt(warehouseID, 10)},
 			},
-			"limit":  1000,
-			"offset": offset,
-			"with":   map[string]any{"analytics_data": true},
+			"limit":    100,
+			"sort_dir": "ASC",
+			"with":     map[string]any{"analytics_data": true},
 		}
-		var resp struct {
-			Result struct {
-				Postings []Posting `json:"postings"`
-				HasNext  bool      `json:"has_next"`
-			} `json:"result"`
+		if cursor != "" {
+			req["cursor"] = cursor
 		}
-		if err := c.call(ctx, "/v3/posting/fbs/list", req, &resp); err != nil {
+		type page struct {
+			Postings []Posting `json:"postings"`
+			HasNext  bool      `json:"has_next"`
+			Cursor   string    `json:"cursor"`
+		}
+		var raw struct {
+			page
+			Result *page `json:"result"` // на случай ответа в обёртке result
+		}
+		if err := c.call(ctx, "/v4/posting/fbs/list", req, &raw); err != nil {
 			return nil, err
 		}
-		all = append(all, resp.Result.Postings...)
-		if !resp.Result.HasNext || len(resp.Result.Postings) == 0 {
+		resp := raw.page
+		if len(resp.Postings) == 0 && raw.Result != nil {
+			resp = *raw.Result
+		}
+		all = append(all, resp.Postings...)
+		if !resp.HasNext || len(resp.Postings) == 0 || resp.Cursor == "" || resp.Cursor == cursor {
 			return all, nil
 		}
-		offset += len(resp.Result.Postings)
-		if offset >= 20000 {
-			return all, fmt.Errorf("в статусе %s больше %d отправлений — список неполный", status, offset)
+		cursor = resp.Cursor
+		if len(all) >= 20000 {
+			return all, fmt.Errorf("в статусе %s больше %d отправлений — список неполный", status, len(all))
 		}
 	}
 }
@@ -375,10 +395,10 @@ type Warehouse struct {
 
 func (c *Client) Warehouses(ctx context.Context) ([]Warehouse, error) {
 	var raw any
-	err := c.call(ctx, "/v1/warehouse/list", map[string]any{}, &raw)
+	err := c.call(ctx, "/v2/warehouse/list", map[string]any{"limit": 200}, &raw)
 	if err != nil {
 		var raw2 any
-		if err2 := c.call(ctx, "/v2/warehouse/list", map[string]any{"limit": 200}, &raw2); err2 != nil {
+		if err2 := c.call(ctx, "/v1/warehouse/list", map[string]any{}, &raw2); err2 != nil {
 			return nil, err
 		}
 		raw = raw2
@@ -478,10 +498,10 @@ func (c *Client) StocksFBS(ctx context.Context, skus []int64) ([]StockRow, error
 		strs[i] = strconv.FormatInt(s, 10)
 	}
 	var raw any
-	err := c.call(ctx, "/v1/product/info/stocks-by-warehouse/fbs", map[string]any{"sku": strs}, &raw)
+	err := c.call(ctx, "/v2/product/info/stocks-by-warehouse/fbs", map[string]any{"sku": skus, "limit": 1000}, &raw)
 	if err != nil {
 		var raw2 any
-		if err2 := c.call(ctx, "/v2/product/info/stocks-by-warehouse/fbs", map[string]any{"sku": skus, "limit": 1000}, &raw2); err2 != nil {
+		if err2 := c.call(ctx, "/v1/product/info/stocks-by-warehouse/fbs", map[string]any{"sku": strs}, &raw2); err2 != nil {
 			return nil, err
 		}
 		raw = raw2

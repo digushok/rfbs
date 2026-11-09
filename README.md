@@ -88,13 +88,13 @@
 
 | Действие | Метод |
 |---|---|
-| Список заказов склада по статусам (с окном доставки `analytics_data.delivery_date_begin/end`) | `/v3/posting/fbs/list` |
+| Список заказов склада по статусам (с окном доставки `analytics_data.delivery_date_begin/end`) | `/v4/posting/fbs/list` |
 | Перепроверка одного заказа | `/v3/posting/fbs/get` |
 | Собрать | `/v4/posting/fbs/ship` |
 | Доставляется / Курьер в пути / Доставлено | `/v2/fbs/posting/delivering`, `/v2/fbs/posting/last-mile`, `/v2/fbs/posting/delivered` |
-| Остатки | `/v2/products/stocks`, `/v1/product/info/stocks-by-warehouse/fbs` |
+| Остатки | `/v2/products/stocks`, `/v2/product/info/stocks-by-warehouse/fbs` |
 | Товары по SKU | `/v3/product/info/list` |
-| Склады | `/v1/warehouse/list` (запасной вариант — `/v2/warehouse/list`) |
+| Склады | `/v2/warehouse/list` (запасной вариант — `/v1/warehouse/list`) |
 | Проверка ключа | `/v1/roles` |
 
 ## Сборка из исходников

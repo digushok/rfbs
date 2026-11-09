@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -281,3 +284,30 @@ func TestConcurrentStartSingleWorker(t *testing.T) {
 		t.Fatalf("ожидали одного работника, получили %d", n)
 	}
 }
+
+// Ответ /v4/posting/fbs/list в формате Ozon: postings/has_next/cursor на верхнем уровне.
+func TestV4ListFormat(t *testing.T) {
+	body := `{"postings":[{"posting_number":"1-1-1","status":"awaiting_packaging","products":[{"sku":5,"quantity":1}],
+	"delivery_method":{"warehouse_id":7},"analytics_data":{"delivery_date_begin":"2026-11-09T10:00:00Z","delivery_date_end":"2026-11-09T14:00:00Z"}}],
+	"has_next":false,"cursor":""}`
+	var gotReq map[string]any
+	c := &Client{base: "http://x", http: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+		json.NewDecoder(r.Body).Decode(&gotReq)
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: http.Header{}}, nil
+	})}}
+	ps, err := c.ListPostings(context.Background(), 7, "awaiting_packaging", time.Now().Add(-time.Hour), time.Now())
+	if err != nil || len(ps) != 1 {
+		t.Fatalf("разбор ответа: %v, %d", err, len(ps))
+	}
+	if _, end := ps[0].Window(); end.IsZero() {
+		t.Fatalf("окно доставки не разобрано")
+	}
+	f := gotReq["filter"].(map[string]any)
+	if f["statuses"] == nil || f["warehouse_ids"] == nil || gotReq["limit"].(float64) > 100 {
+		t.Fatalf("неверный запрос: %v", gotReq)
+	}
+}
+
+type rtFunc func(*http.Request) (*http.Response, error)
+
+func (f rtFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

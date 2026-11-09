@@ -234,7 +234,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 		if err != nil {
 			return nil, err
 		}
-		need := []string{"/v3/posting/fbs/list", "/v4/posting/fbs/ship", "/v2/fbs/posting/delivering", "/v2/fbs/posting/last-mile",
+		need := []string{"/v4/posting/fbs/list", "/v3/posting/fbs/get", "/v4/posting/fbs/ship", "/v2/fbs/posting/delivering", "/v2/fbs/posting/last-mile",
 			"/v2/fbs/posting/delivered", "/v2/products/stocks", "/v3/product/info/list"}
 		var missing []string
 		if len(methods) > 0 {
