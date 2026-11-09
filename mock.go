@@ -310,14 +310,15 @@ func (m *MockOzon) Handle(path string, body []byte) (int, any) {
 			switch {
 			case p == nil:
 				errText = "POSTING_NOT_FOUND"
-			case m.NoTransition[pn]:
+			case m.NoTransition[pn] || p.Substatus == "posting_conditionally_delivered":
 				errText = "invalid transition 3095 -> 380 by seller-delivered"
 			case path == "/v2/fbs/posting/delivering" && p.Status == "awaiting_deliver":
 				p.Status, p.Substatus, ok = "delivering", "posting_transferring_to_delivery", true
 			case path == "/v2/fbs/posting/last-mile" && p.Status == "delivering" && p.Substatus != m.LastMileState[1]:
 				p.Status, p.Substatus, ok = m.LastMileState[0], m.LastMileState[1], true
 			case path == "/v2/fbs/posting/delivered" && (p.Status == m.LastMileState[0] || p.Status == "delivering"):
-				p.Status, p.Substatus, ok = "delivered", "posting_conditionally_delivered", true
+				// Как настоящий Ozon для rFBS: статус остаётся delivering, меняется подстатус.
+				p.Status, p.Substatus, ok = "delivering", "posting_conditionally_delivered", true
 			default:
 				errText = "INVALID_POSTING_STATUS: " + p.Status
 			}

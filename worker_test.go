@@ -73,7 +73,7 @@ func TestLiveFullChain(t *testing.T) {
 	}
 	ck.t = want
 	w.Tick(ctx)
-	if target.Status != "delivered" || target.Substatus != "posting_conditionally_delivered" {
+	if !delivered(target) {
 		t.Fatalf("ожидали условно доставлен, получили %s/%s", target.Status, target.Substatus)
 	}
 	for _, p := range []*Posting{other, single, double, otherWh} {
@@ -124,7 +124,7 @@ func TestOverdueDeliveredImmediately(t *testing.T) {
 		w.Tick(ctx)
 		ck.add(61 * time.Second)
 	}
-	if target.Status != "delivered" {
+	if !delivered(target) {
 		t.Fatalf("ожидали delivered, получили %s", target.Status)
 	}
 }
@@ -320,3 +320,8 @@ func TestV4ListFormat(t *testing.T) {
 type rtFunc func(*http.Request) (*http.Response, error)
 
 func (f rtFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// delivered — заказ условно доставлен (у rFBS Ozon оставляет статус delivering и меняет подстатус).
+func delivered(p *Posting) bool {
+	return p.Status == "delivered" || p.Substatus == "posting_conditionally_delivered"
+}

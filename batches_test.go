@@ -87,7 +87,7 @@ func TestBatchAutoSwitch(t *testing.T) {
 	}
 	run(w, ck, 15)
 	for _, p := range []*Posting{o1, o2, o3, late} {
-		if p.Status != "delivered" {
+		if !delivered(p) {
 			t.Fatalf("заказ %s (%s) не доведён: %s", p.PostingNumber, productsText(p), p.Status)
 		}
 	}

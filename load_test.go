@@ -66,7 +66,7 @@ func runLoad(t *testing.T, lastMile [2]string) {
 		}
 		targets++
 		e := w.journal.Peek(p.PostingNumber)
-		if p.Status != "delivered" || e == nil || e.DoneAt[StageDelivered].IsZero() {
+		if !delivered(p) || e == nil || e.DoneAt[StageDelivered].IsZero() {
 			notDone++
 			continue
 		}
@@ -155,7 +155,7 @@ func TestManyDeliveriesWithinOneMinute(t *testing.T) {
 		e := w.journal.Peek(p.PostingNumber)
 		want := p.AnalyticsData.DeliveryDateEnd.Time.Add(-3 * time.Minute)
 		got := e.DoneAt[StageDelivered]
-		if p.Status != "delivered" || got.Before(want) || got.Sub(want) > 10*time.Second {
+		if !delivered(p) || got.Before(want) || got.Sub(want) > 10*time.Second {
 			t.Fatalf("заказ %d: план %v, переведён %v (%s)", i, want.Format("15:04:05"), got.Format("15:04:05"), p.Status)
 		}
 		t.Logf("заказ %d: конец окна %s, план %s, переведён %s (+%s)", i, p.AnalyticsData.DeliveryDateEnd.Time.Format("15:04:05"),

@@ -33,7 +33,7 @@ func TestManualStepWhileRunning(t *testing.T) {
 	}
 	ck.t = end.Add(-3 * time.Minute)
 	w.Tick(ctx)
-	if p.Status != "delivered" || e.Manual[StageDelivered] {
+	if !delivered(p) || e.Manual[StageDelivered] {
 		t.Fatalf("ожидали «Условно доставлен» от программы в срок, получили %s", p.Status)
 	}
 	v := w.Status().Postings[0]
@@ -60,7 +60,7 @@ func TestPickedBeforeStart(t *testing.T) {
 	}
 	ck.t = end.Add(-3 * time.Minute)
 	w.Tick(context.Background())
-	if p.Status != "delivered" {
+	if !delivered(p) {
 		t.Fatalf("ожидали «Условно доставлен» за 3 минуты до конца окна, получили %s", p.Status)
 	}
 }
@@ -77,8 +77,8 @@ func TestManualDelivered(t *testing.T) {
 	if p.Status != "driver_pickup" {
 		t.Fatalf("подготовка: %s", p.Status)
 	}
-	p.Status, p.Substatus = "delivered", "posting_conditionally_delivered"
-	ck.t = p.AnalyticsData.DeliveryDateEnd.Time.Add(-3 * time.Minute) // программа перепроверит заказ к сроку
+	p.Status, p.Substatus = "delivering", "posting_conditionally_delivered" // так Ozon показывает rFBS после доставки
+	ck.t = p.AnalyticsData.DeliveryDateEnd.Time.Add(-3 * time.Minute)       // программа перепроверит заказ к сроку
 	w.Tick(ctx)
 	e := w.journal.Peek(p.PostingNumber)
 	if e.Final == "" || !e.Manual[StageDelivered] || m.Calls["/v2/fbs/posting/delivered"] != 0 {

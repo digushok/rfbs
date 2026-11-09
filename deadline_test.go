@@ -35,7 +35,7 @@ func TestTwentyOneSameDeadline(t *testing.T) {
 	var first, last time.Time
 	for _, p := range ps {
 		e := w.journal.Peek(p.PostingNumber)
-		if p.Status != "delivered" {
+		if !delivered(p) {
 			t.Fatalf("заказ %s не переведён: %s, ошибка: %s", p.PostingNumber, p.Status, e.LastError)
 		}
 		at := e.DoneAt[StageDelivered]
@@ -75,12 +75,12 @@ func TestBatchRejectedFallbackSingle(t *testing.T) {
 	for i, p := range ps {
 		if i == 2 {
 			e := w.journal.Peek(p.PostingNumber)
-			if p.Status == "delivered" || e.NextTry.Sub(ck.t) != deadlineRetry {
+			if delivered(p) || e.NextTry.Sub(ck.t) != deadlineRetry {
 				t.Fatalf("проблемный заказ: статус %s, повтор через %s", p.Status, e.NextTry.Sub(ck.t))
 			}
 			continue
 		}
-		if p.Status != "delivered" {
+		if !delivered(p) {
 			t.Fatalf("заказ %d должен уйти по одному: %s", i, p.Status)
 		}
 	}
@@ -88,7 +88,7 @@ func TestBatchRejectedFallbackSingle(t *testing.T) {
 	m.BadPostings = nil
 	ck.add(deadlineRetry)
 	w.Tick(context.Background())
-	if ps[2].Status != "delivered" {
+	if !delivered(ps[2]) {
 		t.Fatalf("повтор не сработал: %s", ps[2].Status)
 	}
 }
@@ -127,7 +127,7 @@ func TestInvalidTransitionStops(t *testing.T) {
 	if n := m.Calls["/v2/fbs/posting/delivered"]; n > 3 {
 		t.Fatalf("слишком много попыток: %d", n)
 	}
-	if ok.Status != "delivered" {
+	if !delivered(ok) {
 		t.Fatalf("соседний заказ должен быть переведён: %s", ok.Status)
 	}
 }
