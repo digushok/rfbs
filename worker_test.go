@@ -149,10 +149,14 @@ func TestResumeFromOzonStatus(t *testing.T) {
 	target := m.AddPosting("target")
 	target.Status = "delivering"
 	w.Tick(context.Background())
+	if target.Status != "delivering" {
+		t.Fatalf("после подхвата нужно выждать паузу, а статус уже %s", target.Status)
+	}
+	ck.add(61 * time.Second)
+	w.Tick(context.Background())
 	if target.Status != "driver_pickup" {
 		t.Fatalf("ожидали продолжение цепочки, получили %s", target.Status)
 	}
-	_ = ck
 }
 
 func TestCheckTarget(t *testing.T) {

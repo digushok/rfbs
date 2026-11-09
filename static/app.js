@@ -222,6 +222,7 @@ async function toggleRun() {
 
 function stepCell(v, i) {
   const t = v.plan[i];
+  if (v.manual && v.manual[i] && i <= v.stage) return '<span class="st manual" title="Этап нажат вручную, не программой">✓ вручную</span>';
   if (v.done[i] && i <= v.stage) {
     if (!t || t.startsWith('0001')) return '<span class="st done">✓</span>';
     const simu = !S.profile.live;
@@ -261,7 +262,7 @@ function renderRun() {
     const notes = (v.error ? `<div class="note err">${esc(v.error)}</div>` : '') + (v.warning ? `<div class="note warn">${esc(v.warning)}</div>` : '');
     const win = v.window_end && !v.window_end.startsWith('0001') ? `${fmt(v.window_begin, true)} – ${fmt(v.window_end, true).slice(-5)}` : '<span class="note warn">нет данных</span>';
     return `<tr class="${v.final ? 'fin' : ''}">
-      <td><div class="pn">${esc(v.posting_number)}</div><div class="muted small">${v.batch ? `партия ${v.batch} · ` : ''}создан ${fmt(v.created, true)} · Ozon: ${esc(v.status)}</div></td>
+      <td><div class="pn">${esc(v.posting_number)}${v.picked ? ' <span class="chip warn" title="Часть этапов была нажата вручную — программа подхватила заказ и ведёт его дальше">подхвачен</span>' : ''}${v.no_count ? ' <span class="chip" title="Пара из партии в очереди — в «продано» не считается">вне счёта</span>' : ''}</div><div class="muted small">${v.batch ? `партия ${v.batch} · ` : ''}создан ${fmt(v.created, true)} · Ozon: ${esc(v.status)}</div></td>
       <td class="st">${win}</td>
       ${[1, 2, 3, 4].map(i => `<td>${stepCell(v, i)}</td>`).join('')}
       <td>${now}${notes}</td></tr>`;

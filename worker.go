@@ -55,39 +55,48 @@ func realStage(p *Posting) (stage int, ok bool, final string) {
 
 // checkTarget возвращает "" для целевого заказа или причину пропуска.
 func checkTarget(p *Posting, prof *Profile) string {
-	_, reason := targetBatch(p, prof)
+	_, queued, reason := targetBatch(p, prof)
+	if reason == "" && queued {
+		return "пара из партии, которая ещё в очереди"
+	}
 	return reason
 }
 
-// targetBatch — партия, к которой подходит заказ: склад, ровно 2 SKU по 1 шт., пара из начатой партии.
-func targetBatch(p *Posting, prof *Profile) (string, string) {
+// targetBatch — партия, к которой подходит заказ: склад, ровно 2 SKU по 1 шт., пара из партии.
+// queued=true — пара из партии, которая ещё в очереди (такие заказы берутся, только если их уже продвинули вручную).
+func targetBatch(p *Posting, prof *Profile) (id string, queued bool, reason string) {
 	wh := p.DeliveryMethod.WarehouseID
 	if wh == 0 && p.AnalyticsData != nil {
 		wh = p.AnalyticsData.WarehouseID
 	}
 	if wh != prof.WarehouseID {
-		return "", fmt.Sprintf("другой склад (%d)", wh)
+		return "", false, fmt.Sprintf("другой склад (%d)", wh)
 	}
 	if len(p.Products) != 2 {
-		return "", fmt.Sprintf("в заказе %d поз., нужно ровно 2", len(p.Products))
+		return "", false, fmt.Sprintf("в заказе %d поз., нужно ровно 2", len(p.Products))
 	}
 	for _, pr := range p.Products {
 		if pr.Quantity != 1 {
-			return "", fmt.Sprintf("SKU %d в количестве %d шт., нужно 1", pr.SKU, pr.Quantity)
+			return "", false, fmt.Sprintf("SKU %d в количестве %d шт., нужно 1", pr.SKU, pr.Quantity)
 		}
 	}
 	a, c := p.Products[0].SKU, p.Products[1].SKU
 	if a == c {
-		return "", fmt.Sprintf("SKU %d дважды", a)
+		return "", false, fmt.Sprintf("SKU %d дважды", a)
 	}
 	for i := range prof.Batches {
 		if b := &prof.Batches[i]; b.Started() && b.Matches(a, c) {
-			return b.ID, ""
+			return b.ID, false, ""
+		}
+	}
+	for i := range prof.Batches {
+		if b := &prof.Batches[i]; b.Matches(a, c) {
+			return b.ID, true, ""
 		}
 	}
 	s := []string{fmt.Sprint(a), fmt.Sprint(c)}
 	sort.Strings(s)
-	return "", "другой состав: SKU " + strings.Join(s, ", ") + " (нет такой начатой партии)"
+	return "", false, "другой состав: SKU " + strings.Join(s, ", ") + " (нет такой партии)"
 }
 
 type PostingView struct {
@@ -106,6 +115,9 @@ type PostingView struct {
 	Warning       string       `json:"warning,omitempty"`
 	Error         string       `json:"error,omitempty"`
 	Batch         int          `json:"batch,omitempty"` // номер партии
+	Manual        [5]bool      `json:"manual"`          // этапы, нажатые вручную
+	Picked        bool         `json:"picked,omitempty"`
+	NoCount       bool         `json:"no_count,omitempty"`
 }
 
 type SkipView struct {
@@ -364,11 +376,18 @@ func (w *Worker) Tick(ctx context.Context) time.Time {
 		if ctx.Err() != nil {
 			return time.Time{}
 		}
-		batchID, reason := targetBatch(p, &w.prof)
+		batchID, queued, reason := targetBatch(p, &w.prof)
+		e := w.journal.Peek(p.PostingNumber)
+		if reason == "" && queued && (e == nil || e.Stage < 0) {
+			// Пара из партии в очереди: берём, только если заказ уже продвинули вручную дальше «Ожидает сборки».
+			if rs, ok, _ := realStage(p); !ok || rs < StageShipped {
+				reason = fmt.Sprintf("пара из партии %d, которая ещё в очереди", w.num(batchID))
+			}
+		}
 		if reason != "" {
 			// Заказ, который программа уже взяла в работу (например, партию потом удалили), доводим до конца.
-			if e := w.journal.Peek(p.PostingNumber); e != nil && e.Stage >= 0 {
-				reason, batchID = "", e.Batch
+			if e != nil && e.Stage >= 0 {
+				reason, batchID, queued = "", e.Batch, false
 			}
 		}
 		if reason != "" {
@@ -378,7 +397,7 @@ func (w *Worker) Tick(ctx context.Context) time.Time {
 			w.logOnce("skip|"+p.PostingNumber, "info", "Заказ %s пропущен — не целевой: %s.", p.PostingNumber, reason)
 			continue
 		}
-		if a, ok := w.update(p, now, batchID); ok {
+		if a, ok := w.update(p, now, batchID, queued); ok {
 			pend = append(pend, a)
 		}
 	}
@@ -397,7 +416,7 @@ func (w *Worker) Tick(ctx context.Context) time.Time {
 }
 
 // update синхронизирует запись журнала с данными Ozon и решает, пора ли делать следующий шаг.
-func (w *Worker) update(p *Posting, now time.Time, batchID string) (pendingAction, bool) {
+func (w *Worker) update(p *Posting, now time.Time, batchID string, noCount bool) (pendingAction, bool) {
 	begin, end := p.Window()
 	e := w.journal.Get(p.PostingNumber)
 	e.SeenAt, e.OrderNumber, e.Products, e.Status = now, p.OrderNumber, productsText(p), p.Status
@@ -409,13 +428,18 @@ func (w *Worker) update(p *Posting, now time.Time, batchID string) (pendingActio
 
 	rs, ok, final := realStage(p)
 	if ok && rs > e.Stage {
-		e.Stage = rs
+		w.syncManual(p, e, rs, now)
 	}
 	if e.Batch == "" && batchID != "" && final == "" {
 		e.Batch = batchID
-		w.addSold(batchID, 1)
+		if noCount {
+			e.NoCount = true
+			w.log.Add("info", "Заказ %s — пара из партии %d, которая ещё в очереди: веду его до конца, но в «продано» не считаю.", p.PostingNumber, w.num(batchID))
+		} else {
+			w.addSold(batchID, 1)
+		}
 	}
-	if final == "отменён" && e.Batch != "" && !e.Uncounted {
+	if final == "отменён" && e.Batch != "" && !e.Uncounted && !e.NoCount {
 		e.Uncounted = true
 		w.addSold(e.Batch, -1)
 	}
@@ -466,11 +490,51 @@ func (w *Worker) update(p *Posting, now time.Time, batchID string) (pendingActio
 	return pendingAction{p: p, e: e, next: next}, true
 }
 
+// syncManual поднимает этап по данным Ozon. Этапы, которые программа не выполняла, помечаются как ручные.
+func (w *Worker) syncManual(p *Posting, e *JEntry, rs int, now time.Time) {
+	first := e.Stage < 0
+	var manual []string
+	for i := max(e.Stage+1, StageShipped); i <= rs; i++ {
+		if !e.DoneAt[i].IsZero() {
+			continue
+		}
+		if i == e.Stage+1 && e.Fails > 0 && e.LastError != "" && strings.Contains(e.LastError, "«"+actionNames[i]+"»") {
+			// Наш запрос, ответ на который не дошёл, — Ozon его всё-таки выполнил.
+			e.DoneAt[i], e.Fails, e.LastError, e.NextTry = now, 0, "", time.Time{}
+			w.log.Add("ok", "Заказ %s: «%s» — выполнено (подтверждено по статусу Ozon).", p.PostingNumber, actionNames[i])
+			continue
+		}
+		e.Manual[i] = true
+		manual = append(manual, "«"+actionNames[i]+"»")
+	}
+	e.Stage = rs
+	if len(manual) == 0 {
+		return
+	}
+	e.ManualAt, e.Picked = now, true
+	e.Fails, e.LastError, e.NextTry = 0, "", time.Time{}
+	steps := strings.Join(manual, ", ")
+	switch {
+	case rs >= StageDelivered:
+		w.log.Add("info", "Заказ %s: %s выставлено вручную (не программой). Заказ завершён.", p.PostingNumber, steps)
+	case first:
+		w.log.Add("info", "Заказ %s подхвачен в работу: в Ozon уже «%s», этапы %s выполнены вручную (не программой). Дальше веду сам: следующий шаг — «%s» через паузу.",
+			p.PostingNumber, stageNames[rs], steps, actionNames[rs+1])
+	default:
+		w.log.Add("info", "Заказ %s: этап %s выполнен вручную (не программой). Продолжаю: следующий шаг — «%s» через паузу.",
+			p.PostingNumber, steps, actionNames[rs+1])
+	}
+}
+
 // dueFor — когда можно выполнить шаг next.
 func (w *Worker) dueFor(next int, e *JEntry, now time.Time) (time.Time, string) {
 	pause := time.Duration(w.prof.PauseSec) * time.Second
 	earliest := now
-	if last := e.LastActionAt(); !last.IsZero() && last.Add(pause).After(now) {
+	last := e.LastActionAt()
+	if e.ManualAt.After(last) {
+		last = e.ManualAt // после ручного шага ждём паузу от момента, когда его заметили
+	}
+	if !last.IsZero() && last.Add(pause).After(now) {
 		earliest = last.Add(pause)
 	}
 	if next < StageDelivered {
@@ -588,7 +652,7 @@ func (w *Worker) buildViews(now time.Time) ([]PostingView, time.Time) {
 		}
 		v := PostingView{PostingNumber: e.PostingNumber, OrderNumber: e.OrderNumber, Created: e.Created, Status: e.Status,
 			Stage: e.Stage, Final: e.Final, WindowBegin: e.WindowBegin, WindowEnd: e.WindowEnd, Warning: e.Warning, Error: e.LastError,
-			Batch: w.num(e.Batch)}
+			Batch: w.num(e.Batch), Manual: e.Manual, Picked: e.Picked, NoCount: e.NoCount}
 		for i := 0; i <= StageDelivered; i++ {
 			v.Done[i] = e.Stage >= 0 && i <= e.Stage
 			v.Plan[i] = e.DoneAt[i]

@@ -122,6 +122,7 @@ table.grid { width: 100%; border-collapse: collapse; }
 .st.done { color: var(--ok); }
 .st.plan { color: var(--ink2); }
 .st.simu { color: var(--test); }
+.st.manual { color: var(--warn); }
 .chip { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; background: var(--field); color: var(--ink2); white-space: nowrap; }
 .chip.ok { background: var(--ok-soft); color: var(--ok); }
 .chip.warn { background: var(--warn-soft); color: var(--warn); }

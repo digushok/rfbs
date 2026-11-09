@@ -316,6 +316,10 @@ type JEntry struct {
 	SeenAt        time.Time    `json:"seen_at"`             // когда последний раз получали данные из Ozon
 	Batch         string       `json:"batch,omitempty"`     // партия, к которой привязан заказ
 	Uncounted     bool         `json:"uncounted,omitempty"` // отменён и вычтен из «продано»
+	NoCount       bool         `json:"no_count,omitempty"`  // не учитывается в «продано» (пара из партии в очереди)
+	Manual        [5]bool      `json:"manual"`              // этап выполнен не программой (нажат вручную)
+	ManualAt      time.Time    `json:"manual_at"`           // когда программа заметила ручной шаг (от него — пауза)
+	Picked        bool         `json:"picked,omitempty"`    // заказ подхвачен: часть этапов сделана вручную
 
 	// Сведения для отображения (последние данные из Ozon).
 	OrderNumber string    `json:"order_number,omitempty"`
