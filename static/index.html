@@ -48,6 +48,13 @@
           <button class="btn ghost" id="batchNext" title="Завершить текущую партию и запустить следующую из очереди">Следующая партия →</button>
         </div>
       </div>
+      <div class="row wrap tplbar">
+        <select id="tplSel" class="tplsel"></select>
+        <button class="btn soft sm" id="tplLoad">Загрузить очередь</button>
+        <button class="btn ghost sm" id="tplSaveAs">Сохранить текущую как…</button>
+        <span class="grow"></span>
+        <button class="btn danger sm" id="queueReset" title="Удалить все партии и выключить автоматизацию">Сбросить очередь</button>
+      </div>
       <div class="scroll"><table class="grid batches" id="batchTable">
         <thead><tr><th style="width:44px">№</th><th>SKU 1</th><th>SKU 2</th><th class="r" style="width:110px">Кол-во, шт.</th><th style="width:300px">Состояние</th><th style="width:120px"></th></tr></thead>
         <tbody></tbody>
@@ -144,8 +151,15 @@
           <input type="number" id="pPrestock" min="0" title="0 — только после того, как текущая партия распродана полностью"></label>
         <span class="muted small self-end">Например, 3: в партии на 25 после 22-го заказа следующая пара уже выставляется в наличие. Одновременно в продаже не больше двух пар. 0 — следующая выставляется только после полной распродажи.</span>
         <label class="switch"><input type="checkbox" id="pZeroOld"> Обнулять остаток старой пары, когда партия завершена</label>
+        <label class="switch"><input type="checkbox" id="pZeroReset"> Обнулять остаток пар в продаже при сбросе очереди</label>
       </div>
       <div class="row"><button class="btn primary" id="pSave">Сохранить</button><span id="pMsg" class="muted"></span></div>
+    </div>
+
+    <div class="card">
+      <div class="card-h"><div><h2>Сохранённые очереди</h2><p class="sub">Готовые наборы пар SKU с количеством. На вкладке «Заказы» очередь выбирается в списке и загружается одним нажатием</p></div>
+        <div class="actions"><button class="btn soft" id="tplNew">+ Новая очередь</button></div></div>
+      <div id="tplList" class="tpls"></div>
     </div>
 
     <div class="card">

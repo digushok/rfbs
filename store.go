@@ -23,12 +23,14 @@ type Profile struct {
 	WarehouseID   int64  `json:"warehouse_id"`
 	WarehouseName string `json:"warehouse_name"`
 	// Партии — пары SKU по очереди. Старые поля SKU1/SKU2/StockQty — только для перехода с версий до 1.2.
-	Batches      []Batch `json:"batches"`
-	KeepOldStock bool    `json:"keep_old_stock"` // false (по умолчанию) — обнулять остаток старой пары при переключении
-	PrestockLeft *int    `json:"prestock_left"`  // за сколько заказов до конца партии выставлять следующую (nil — 3)
-	SKU1         int64   `json:"sku1,omitempty"`
-	SKU2         int64   `json:"sku2,omitempty"`
-	StockQty     int     `json:"stock_qty,omitempty"`
+	Batches      []Batch         `json:"batches"`
+	KeepOldStock bool            `json:"keep_old_stock"` // false (по умолчанию) — обнулять остаток старой пары при переключении
+	PrestockLeft *int            `json:"prestock_left"`  // за сколько заказов до конца партии выставлять следующую (nil — 3)
+	KeepOnReset  bool            `json:"keep_on_reset"`  // false (по умолчанию) — при сбросе очереди обнулять остаток пар в продаже
+	Templates    []QueueTemplate `json:"templates"`      // сохранённые очереди
+	SKU1         int64           `json:"sku1,omitempty"`
+	SKU2         int64           `json:"sku2,omitempty"`
+	StockQty     int             `json:"stock_qty,omitempty"`
 
 	Live         bool `json:"live"`          // false — тестовый режим
 	PauseSec     int  `json:"pause_sec"`     // пауза между шагами
@@ -36,6 +38,19 @@ type Profile struct {
 	PollSec      int  `json:"poll_sec"`      // как часто опрашивать Ozon
 	LookbackDays int  `json:"lookback_days"` // за сколько дней смотреть заказы
 	Running      bool `json:"running"`       // автоматизация включена (восстанавливается после перезапуска)
+}
+
+// QueueTemplate — сохранённая очередь: имя и пары SKU с количеством.
+type QueueTemplate struct {
+	ID   string   `json:"id"`
+	Name string   `json:"name"`
+	Rows []TplRow `json:"rows"`
+}
+
+type TplRow struct {
+	SKU1 int64 `json:"sku1"`
+	SKU2 int64 `json:"sku2"`
+	Qty  int   `json:"qty"`
 }
 
 // Состояния партии.
@@ -75,6 +90,22 @@ func (p *Profile) Prestock() int {
 		return defaultPrestock
 	}
 	return *p.PrestockLeft
+}
+
+// clone — независимая копия (списки партий и очередей не делятся с оригиналом).
+func (p *Profile) clone() Profile {
+	c := *p
+	c.Batches = append([]Batch(nil), p.Batches...)
+	c.Templates = make([]QueueTemplate, len(p.Templates))
+	for i, t := range p.Templates {
+		t.Rows = append([]TplRow(nil), t.Rows...)
+		c.Templates[i] = t
+	}
+	if p.PrestockLeft != nil {
+		v := *p.PrestockLeft
+		c.PrestockLeft = &v
+	}
+	return c
 }
 
 func (p *Profile) ActiveBatch() *Batch {
@@ -229,7 +260,7 @@ func (s *Store) Get(id string) (Profile, bool) {
 	if p == nil {
 		return Profile{}, false
 	}
-	return *p, true
+	return p.clone(), true
 }
 
 func (s *Store) Update(id string, fn func(p *Profile)) (Profile, error) {
@@ -241,7 +272,7 @@ func (s *Store) Update(id string, fn func(p *Profile)) (Profile, error) {
 	}
 	fn(p)
 	p.normalize()
-	return *p, s.saveLocked()
+	return p.clone(), s.saveLocked()
 }
 
 func (s *Store) Add(p *Profile) error {
@@ -287,7 +318,7 @@ func (s *Store) Snapshot() (active string, list []Profile) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, p := range s.Profiles {
-		list = append(list, *p)
+		list = append(list, p.clone())
 	}
 	return s.Active, list
 }
@@ -334,6 +365,7 @@ type JEntry struct {
 	Manual        [5]bool      `json:"manual"`              // этап выполнен не программой (нажат вручную)
 	ManualAt      time.Time    `json:"manual_at"`           // когда программа заметила ручной шаг (от него — пауза)
 	Picked        bool         `json:"picked,omitempty"`    // заказ подхвачен: часть этапов сделана вручную
+	Abandoned     bool         `json:"abandoned,omitempty"` // брошен при сбросе очереди: программа его больше не трогает
 
 	// Сведения для отображения (последние данные из Ozon).
 	OrderNumber string    `json:"order_number,omitempty"`

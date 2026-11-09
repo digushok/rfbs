@@ -21,9 +21,10 @@ function toast(msg, err) {
   clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.add('hidden'), err ? 6000 : 3000);
 }
 
-function confirmBox(html, yes = 'Да') {
+function confirmBox(html, yes = 'Да', danger = false) {
   return new Promise(res => {
     $('#modalBody').innerHTML = html; $('#modalYes').textContent = yes;
+    $('#modalYes').className = 'btn ' + (danger ? 'danger' : 'primary');
     $('#modal').classList.remove('hidden');
     const done = v => { $('#modal').classList.add('hidden'); $('#modalYes').onclick = $('#modalNo').onclick = null; res(v); };
     $('#modalYes').onclick = () => done(true); $('#modalNo').onclick = () => done(false);
@@ -80,7 +81,8 @@ function renderProfile(full = true) {
   $('#sKey').value = ''; $('#sKey').placeholder = p.api_key_set ? 'сохранён (введите новый, чтобы заменить)' : '';
   $('#sName').disabled = false; $('#sClient').disabled = $('#sKey').disabled = p.demo;
   $('#pPause').value = p.pause_sec; $('#pMargin').value = p.margin_min; $('#pPoll').value = p.poll_sec; $('#pLook').value = p.lookback_days;
-  $('#pPrestock').value = p.prestock_left ?? 3; $('#pZeroOld').checked = !p.keep_old_stock;
+  $('#pPrestock').value = p.prestock_left ?? 3; $('#pZeroOld').checked = !p.keep_old_stock; $('#pZeroReset').checked = !p.keep_on_reset;
+  renderTemplates();
 }
 
 function renderShops() {
@@ -308,7 +310,7 @@ $$('.tabs button').forEach(b => b.onclick = () => {
   $$('.tab').forEach(t => t.classList.toggle('hidden', t.id !== 'tab-' + b.dataset.tab));
   if (b.dataset.tab === 'log') { renderLog(); const box = $('#logList'); box.scrollTop = box.scrollHeight; }
 });
-$('#shopSel').onchange = async e => { await api('/api/profile/select', { id: e.target.value }); run = null; queueEdit = null; await loadState(); refreshRun(); refreshLog(); loadProducts(); };
+$('#shopSel').onchange = async e => { await api('/api/profile/select', { id: e.target.value }); run = null; queueEdit = null; tplEdit = {}; await loadState(); refreshRun(); refreshLog(); loadProducts(); };
 $('#quitBtn').onclick = async () => {
   const anyRun = S.shops.some(s => s.running);
   if (!(await confirmBox(`<h3>Закрыть программу?</h3>${anyRun ? '<p>Автоматизация будет приостановлена до следующего запуска программы. Пока программа закрыта, статусы заказов не меняются.</p>' : ''}`, 'Закрыть'))) return;
@@ -383,7 +385,7 @@ $('#sCheck').onclick = async () => {
 $('#pSave').onclick = async () => {
   try {
     await api('/api/profile/save', { id: S.profile.id, pause_sec: $('#pPause').value, margin_min: $('#pMargin').value, poll_sec: $('#pPoll').value, lookback_days: $('#pLook').value,
-      prestock_left: $('#pPrestock').value, keep_old_stock: !$('#pZeroOld').checked });
+      prestock_left: $('#pPrestock').value, keep_old_stock: !$('#pZeroOld').checked, keep_on_reset: !$('#pZeroReset').checked });
     $('#pMsg').textContent = 'Сохранено'; setTimeout(() => $('#pMsg').textContent = '', 2500); await loadState();
   } catch (e) { toast(e.message, true); }
 };
@@ -407,6 +409,169 @@ $('#updCheck').onclick = async () => {
       : `<div>У вас последняя версия (${esc(j.current)}).</div>`;
   } catch (e) { box.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
 };
+// ---------------- сохранённые очереди и сброс ----------------
+let tplEdit = {}; // id → {name, rows} — правки, ещё не сохранённые
+
+function promptBox(html, value, yes = 'Сохранить') {
+  return new Promise(res => {
+    $('#modalBody').innerHTML = html + `<input id="promptIn" class="full" value="${esc(value || '')}">`;
+    $('#modalYes').textContent = yes; $('#modalYes').className = 'btn primary';
+    $('#modal').classList.remove('hidden');
+    const inp = $('#promptIn'); inp.focus(); inp.select();
+    const done = v => { $('#modal').classList.add('hidden'); $('#modalYes').onclick = $('#modalNo').onclick = inp.onkeydown = null; res(v); };
+    $('#modalYes').onclick = () => done(inp.value.trim());
+    $('#modalNo').onclick = () => done(null);
+    inp.onkeydown = e => { if (e.key === 'Enter') done(inp.value.trim()); if (e.key === 'Escape') done(null); };
+  });
+}
+
+function templates() { return (S.profile && S.profile.templates) || []; }
+
+function renderTplSelect() {
+  const sel = $('#tplSel'), cur = sel.value, list = templates();
+  sel.innerHTML = list.length
+    ? '<option value="">— выберите сохранённую очередь —</option>' + list.map(t => `<option value="${t.id}">${esc(t.name)} · пар: ${t.rows.length}</option>`).join('')
+    : '<option value="">Сохранённых очередей нет — создайте в «Настройках»</option>';
+  if (list.some(t => t.id === cur)) sel.value = cur;
+}
+
+function renderTemplates() {
+  renderTplSelect();
+  const box = $('#tplList');
+  if (box.contains(document.activeElement)) return;
+  const list = templates().map(t => tplEdit[t.id] ? { id: t.id, ...tplEdit[t.id], dirty: true } : { id: t.id, name: t.name, rows: t.rows.map(r => ({ ...r })) });
+  if (tplEdit.new) list.push({ id: 'new', ...tplEdit.new, dirty: true });
+  box.innerHTML = list.map(t => `<div class="tpl" data-tid="${t.id}">
+      <div class="row tight tpl-h">
+        <input class="tname" data-tf="name" value="${esc(t.name)}" placeholder="Имя очереди, например «Чехлы весна»">
+        <span class="muted small">пар: ${t.rows.length}</span>
+        ${t.dirty ? '<span class="chip warn">не сохранено</span>' : ''}
+        <span class="grow"></span>
+        <button class="btn primary sm" data-tsave="${t.id}">Сохранить</button>
+        <button class="btn danger sm" data-tdel="${t.id}">${t.id === 'new' ? 'Отмена' : 'Удалить'}</button>
+      </div>
+      <table class="grid tplrows"><thead><tr><th style="width:40px">№</th><th>SKU 1</th><th>SKU 2</th><th class="r" style="width:120px">Кол-во, шт.</th><th style="width:110px"></th></tr></thead><tbody>
+      ${t.rows.map((r, i) => `<tr data-ri="${i}"><td class="bn">${i + 1}</td>
+        <td><input data-rf="sku1" inputmode="numeric" value="${esc(r.sku1 || '')}" placeholder="SKU Ozon"></td>
+        <td><input data-rf="sku2" inputmode="numeric" value="${esc(r.sku2 || '')}" placeholder="SKU Ozon"></td>
+        <td class="r"><input data-rf="qty" class="qty" type="number" min="1" value="${esc(r.qty || '')}"></td>
+        <td><div class="icons"><button class="btn ghost sm" data-rup="${i}">↑</button><button class="btn ghost sm" data-rdown="${i}">↓</button><button class="btn ghost sm" data-rdel="${i}">✕</button></div></td></tr>`).join('')}
+      </tbody></table>
+      <button class="btn ghost sm" data-radd="${t.id}">+ Пара</button>
+    </div>`).join('') || '<div class="muted">Сохранённых очередей пока нет.</div>';
+}
+
+function tplState(tid) {
+  if (!tplEdit[tid]) {
+    const t = templates().find(x => x.id === tid);
+    tplEdit[tid] = { name: t.name, rows: t.rows.map(r => ({ ...r })) };
+  }
+  return tplEdit[tid];
+}
+
+$('#tplNew').onclick = () => {
+  tplEdit.new = tplEdit.new || { name: '', rows: [{ sku1: '', sku2: '', qty: '' }] };
+  if (document.activeElement) document.activeElement.blur();
+  renderTemplates();
+  const inp = $('#tplList .tpl[data-tid="new"] .tname'); if (inp) inp.focus();
+};
+
+$('#tplList').addEventListener('input', e => {
+  const box = e.target.closest('.tpl'); if (!box) return;
+  const st = tplState(box.dataset.tid);
+  if (e.target.dataset.tf) st.name = e.target.value;
+  if (e.target.dataset.rf) st.rows[+e.target.closest('tr').dataset.ri][e.target.dataset.rf] = e.target.value.trim();
+});
+
+$('#tplList').addEventListener('click', async e => {
+  const d = e.target.dataset, box = e.target.closest('.tpl'); if (!box) return;
+  const tid = box.dataset.tid;
+  const rerender = () => { if (document.activeElement) document.activeElement.blur(); renderTemplates(); };
+  if (d.radd) { tplState(tid).rows.push({ sku1: '', sku2: '', qty: '' }); rerender(); const ins = $$('#tplList .tpl[data-tid="' + tid + '"] tr[data-ri] input'); if (ins.length) ins[ins.length - 3].focus(); return; }
+  if (d.rup !== undefined || d.rdown !== undefined || d.rdel !== undefined) {
+    const rows = tplState(tid).rows, i = +(d.rup ?? d.rdown ?? d.rdel);
+    if (d.rdel !== undefined) rows.splice(i, 1);
+    else { const j = d.rup !== undefined ? i - 1 : i + 1; if (j >= 0 && j < rows.length) [rows[i], rows[j]] = [rows[j], rows[i]]; }
+    rerender(); return;
+  }
+  if (d.tsave) {
+    const st = tplState(tid);
+    try {
+      await api('/api/templates/save', { id: S.profile.id, template: { id: tid === 'new' ? '' : tid, name: st.name.trim(), rows: st.rows } });
+      delete tplEdit[tid];
+      toast('Очередь «' + st.name.trim() + '» сохранена');
+      if (document.activeElement) document.activeElement.blur();
+      await loadState();
+    } catch (er) { toast(er.message, true); }
+    return;
+  }
+  if (d.tdel) {
+    if (tid === 'new') { delete tplEdit.new; rerender(); return; }
+    const t = templates().find(x => x.id === tid);
+    if (!(await confirmBox(`<h3>Удалить очередь «${esc(t.name)}»?</h3><p>Уже загруженные партии не изменятся.</p>`, 'Удалить'))) return;
+    try { await api('/api/templates/delete', { id: S.profile.id, template_id: tid }); delete tplEdit[tid]; await loadState(); } catch (er) { toast(er.message, true); }
+  }
+});
+
+$('#tplLoad').onclick = async () => {
+  const tid = $('#tplSel').value;
+  if (!tid) return toast('Выберите сохранённую очередь', true);
+  const t = templates().find(x => x.id === tid);
+  const queued = (queueEdit || batchSource().filter(b => b.state === 'queued')).length;
+  const pairs = t.rows.map((r, i) => `${i + 1}. SKU ${r.sku1} + ${r.sku2} — ${r.qty} шт.`).join('<br>');
+  const html = `<h3>Загрузить очередь «${esc(t.name)}»?</h3>
+    <p>${queued ? `Партии «в очереди» (${queued}) будут заменены.` : 'В очередь добавятся:'} Партии, которые уже продаются или доставляются, не изменятся.</p>
+    <div class="modal-list">${pairs}</div>`;
+  if (!(await confirmBox(html, 'Загрузить'))) return;
+  const keep = $$('#batchTable tr[data-keep]').map(tr => tr.dataset.keep);
+  try {
+    await api('/api/templates/load', { id: S.profile.id, template_id: tid, keep_ids: keep });
+    queueEdit = null;
+    toast('Очередь «' + t.name + '» загружена');
+    await loadState(); await refreshRun(); loadProducts();
+  } catch (er) { toast(er.message, true); }
+};
+
+$('#tplSaveAs').onclick = async () => {
+  const src = batchSource();
+  const rows = src.filter(b => b.state !== 'queued').map(b => ({ sku1: b.sku1, sku2: b.sku2, qty: b.qty }))
+    .concat((queueEdit || src.filter(b => b.state === 'queued')).map(b => ({ sku1: b.sku1, sku2: b.sku2, qty: b.qty })));
+  if (!rows.length) return toast('Таблица партий пуста — сохранять нечего', true);
+  const name = await promptBox(`<h3>Сохранить текущую очередь</h3><p class="muted">В неё войдут все ${rows.length} пар из таблицы партий с их количеством. Потом её можно выбрать в списке и загрузить одним нажатием.</p><label class="fld">Имя очереди</label>`, '');
+  if (!name) return;
+  try {
+    await api('/api/templates/save', { id: S.profile.id, template: { name, rows } });
+    toast('Очередь «' + name + '» сохранена');
+    await loadState();
+  } catch (er) { toast(er.message, true); }
+};
+
+$('#queueReset').onclick = async () => {
+  let info;
+  try { info = await api('/api/batches/reset-preview?id=' + S.profile.id); } catch (er) { return toast(er.message, true); }
+  const pair = b => `SKU ${b.sku1} + ${b.sku2}`;
+  let html = `<h3>Сбросить очередь?</h3><p>Все партии будут удалены из списка, автоматизация <b>выключится</b>. Чтобы снова начать работу, загрузите или добавьте очередь и нажмите «Запустить».</p>`;
+  if (info.on_sale && info.on_sale.length) {
+    html += info.zero
+      ? `<p><b>Будет обнулён остаток в Ozon</b>${info.live ? '' : ' (тестовый режим — только в журнале)'}:<br>${info.on_sale.map(pair).join('<br>')}</p>`
+      : `<p>Остаток пар в продаже <b>не обнуляется</b> (отключено в настройках) — покупатели смогут их заказывать, но программа эти заказы обрабатывать не будет:<br>${info.on_sale.map(pair).join('<br>')}</p>`;
+  }
+  const u = info.undelivered || [];
+  if (u.length) {
+    html += `<div class="banner err"><b>Внимание: эти заказы не доставлены (${u.length})!</b><br>Программа их бросит — статусы больше меняться не будут. Переведите их вручную в кабинете Ozon.</div>
+      <div class="modal-list">${u.slice(0, 50).map(x => `<div><b>${esc(x.posting_number)}</b> — ${esc(x.stage)}${x.window_end && !x.window_end.startsWith('0001') ? ', окно до ' + fmt(x.window_end, true) : ''}</div>`).join('')}${u.length > 50 ? `<div class="muted">и ещё ${u.length - 50}</div>` : ''}</div>`;
+  } else {
+    html += '<p class="muted">Недоставленных заказов в работе нет.</p>';
+  }
+  if (!(await confirmBox(html, u.length ? 'Сбросить и бросить заказы' : 'Сбросить', true))) return;
+  try {
+    const j = await api('/api/batches/reset', { id: S.profile.id });
+    queueEdit = null;
+    if (j.warning) toast(j.warning, true); else toast('Очередь сброшена, автоматизация выключена');
+    await loadState(); await refreshRun(); refreshLog(); loadProducts();
+  } catch (er) { toast(er.message, true); }
+};
+
 $('#dOpen').onclick = () => api('/api/open-dir', {});
 
 (async () => {

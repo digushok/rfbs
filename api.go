@@ -92,6 +92,33 @@ func num(b map[string]any, k string) (int64, bool) {
 	return 0, false
 }
 
+// parseRows — строки очереди из запроса: SKU 1, SKU 2, количество.
+func parseRows(v any) ([]TplRow, error) {
+	list, _ := v.([]any)
+	var rows []TplRow
+	for i, x := range list {
+		m, _ := x.(map[string]any)
+		if m == nil {
+			continue
+		}
+		a, _ := num(m, "sku1")
+		c, _ := num(m, "sku2")
+		q, _ := num(m, "qty")
+		if a == 0 && c == 0 && q == 0 {
+			continue // пустая строка
+		}
+		b := Batch{SKU1: a, SKU2: c, Qty: int(q)}
+		if err := b.Validate(); err != nil {
+			return nil, fmt.Errorf("строка %d: %v", i+1, err)
+		}
+		if q <= 0 {
+			return nil, fmt.Errorf("строка %d: укажите количество больше 0", i+1)
+		}
+		rows = append(rows, TplRow{SKU1: a, SKU2: c, Qty: int(q)})
+	}
+	return rows, nil
+}
+
 func (s *Server) id(r *http.Request, b map[string]any) string {
 	if v := str(b, "id"); v != "" {
 		return v
@@ -153,6 +180,9 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			}
 			if v, ok := b["keep_old_stock"].(bool); ok {
 				p.KeepOldStock = v
+			}
+			if v, ok := b["keep_on_reset"].(bool); ok {
+				p.KeepOnReset = v
 			}
 			if v, ok := num(b, "prestock_left"); ok && v >= 0 {
 				n := int(v)
@@ -386,6 +416,125 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			return nil, uerr
 		}
 		return map[string]any{"ok": true}, err
+	})
+
+	s.handle(mux, "/api/batches/reset-preview", func(r *http.Request, b map[string]any) (any, error) {
+		return s.mgr.ResetPreview(s.id(r, b))
+	})
+
+	s.handle(mux, "/api/batches/reset", func(r *http.Request, b map[string]any) (any, error) {
+		ctx, cancel := ctx30()
+		defer cancel()
+		info, warning, err := s.mgr.ResetQueue(ctx, s.id(r, b))
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"ok": true, "warning": warning, "abandoned": len(info.Undeliver)}, nil
+	})
+
+	s.handle(mux, "/api/templates/save", func(r *http.Request, b map[string]any) (any, error) {
+		id := s.id(r, b)
+		t, _ := b["template"].(map[string]any)
+		if t == nil {
+			return nil, fmt.Errorf("нет данных очереди")
+		}
+		tpl := QueueTemplate{ID: str(t, "id"), Name: str(t, "name")}
+		if tpl.Name == "" {
+			return nil, fmt.Errorf("укажите имя очереди")
+		}
+		rows, err := parseRows(t["rows"])
+		if err != nil {
+			return nil, err
+		}
+		if len(rows) == 0 {
+			return nil, fmt.Errorf("в очереди нет ни одной пары")
+		}
+		tpl.Rows = rows
+		var dup bool
+		_, uerr := s.store.Update(id, func(p *Profile) {
+			for _, x := range p.Templates {
+				if x.ID != tpl.ID && strings.EqualFold(strings.TrimSpace(x.Name), tpl.Name) {
+					dup = true
+					return
+				}
+			}
+			for i := range p.Templates {
+				if tpl.ID != "" && p.Templates[i].ID == tpl.ID {
+					p.Templates[i] = tpl
+					return
+				}
+			}
+			tpl.ID = newID()
+			p.Templates = append(p.Templates, tpl)
+		})
+		if uerr != nil {
+			return nil, uerr
+		}
+		if dup {
+			return nil, fmt.Errorf("очередь с именем «%s» уже есть — выберите другое имя", tpl.Name)
+		}
+		return map[string]any{"ok": true, "id": tpl.ID}, nil
+	})
+
+	s.handle(mux, "/api/templates/delete", func(r *http.Request, b map[string]any) (any, error) {
+		tid := str(b, "template_id")
+		_, err := s.store.Update(s.id(r, b), func(p *Profile) {
+			var out []QueueTemplate
+			for _, x := range p.Templates {
+				if x.ID != tid {
+					out = append(out, x)
+				}
+			}
+			p.Templates = out
+		})
+		return map[string]any{"ok": true}, err
+	})
+
+	s.handle(mux, "/api/templates/load", func(r *http.Request, b map[string]any) (any, error) {
+		id, tid := s.id(r, b), str(b, "template_id")
+		keep := map[string]bool{}
+		if ids, ok := b["keep_ids"].([]any); ok {
+			for _, x := range ids {
+				if v, ok := x.(string); ok {
+					keep[v] = true
+				}
+			}
+		}
+		var name string
+		var n int
+		var lerr error
+		_, err := s.store.Update(id, func(p *Profile) {
+			var tpl *QueueTemplate
+			for i := range p.Templates {
+				if p.Templates[i].ID == tid {
+					tpl = &p.Templates[i]
+				}
+			}
+			if tpl == nil {
+				lerr = fmt.Errorf("очередь не найдена")
+				return
+			}
+			var out []Batch
+			for _, bt := range p.Batches { // начатые партии не трогаем, заменяем только «в очереди»
+				if bt.Started() || keep[bt.ID] {
+					out = append(out, bt)
+				}
+			}
+			for _, row := range tpl.Rows {
+				out = append(out, Batch{ID: newID(), SKU1: row.SKU1, SKU2: row.SKU2, Qty: row.Qty, State: BatchQueued})
+			}
+			p.Batches = out
+			name, n = tpl.Name, len(tpl.Rows)
+		})
+		if err == nil {
+			err = lerr
+		}
+		if err != nil {
+			return nil, err
+		}
+		s.mgr.Log(id).Add("info", "Загружена очередь «%s»: %d пар(ы) в очереди.", name, n)
+		s.mgr.Kick(id)
+		return map[string]any{"ok": true}, nil
 	})
 
 	s.handle(mux, "/api/batches/next", func(r *http.Request, b map[string]any) (any, error) {

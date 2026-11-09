@@ -170,6 +170,19 @@ details.skipped[open] summary { margin-bottom: 12px; }
 .bar i { display: block; height: 100%; background: var(--accent); border-radius: 6px; }
 .icons { display: flex; gap: 2px; justify-content: flex-end; }
 .icons .btn { padding: 4px 8px; }
+/* сохранённые очереди */
+.tplbar { margin: 0 0 12px; }
+.tplsel { min-width: 280px; max-width: 420px; }
+.tpls { display: flex; flex-direction: column; gap: 14px; }
+.tpl { border: 1px solid var(--line); border-radius: var(--r-md); padding: 12px 14px; }
+.tpl-h { margin-bottom: 8px; gap: 10px; }
+.tpl .tname { min-width: 320px; font-weight: 600; }
+.tplrows td { vertical-align: middle; padding: 6px 10px; }
+.tplrows input { width: 100%; }
+.tplrows input.qty { width: 90px; text-align: right; }
+.modal-list { max-height: 260px; overflow: auto; background: var(--field); border-radius: var(--r-sm); padding: 8px 12px; font-size: 13px; margin: 8px 0; }
+#modalBody { max-height: 70vh; overflow: auto; }
+input.full { width: 100%; margin-top: 6px; }
 .subh { font-size: 13px; font-weight: 600; margin: 20px 0 10px; color: var(--ink2); }
 .self-end { align-self: end; }
 .batches tr.next td { background: #f6faf3; }

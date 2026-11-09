@@ -376,8 +376,14 @@ func (w *Worker) Tick(ctx context.Context) time.Time {
 		if ctx.Err() != nil {
 			return time.Time{}
 		}
-		batchID, queued, reason := targetBatch(p, &w.prof)
 		e := w.journal.Peek(p.PostingNumber)
+		if e != nil && e.Abandoned {
+			if len(skipped) < 300 {
+				skipped = append(skipped, SkipView{PostingNumber: p.PostingNumber, Status: p.Status, Reason: "брошен при сбросе очереди", Created: p.InProcessAt.Time, Products: productsText(p)})
+			}
+			continue
+		}
+		batchID, queued, reason := targetBatch(p, &w.prof)
 		if reason == "" && queued && (e == nil || e.Stage < 0) {
 			// Пара из партии в очереди: берём, только если заказ уже продвинули вручную дальше «Ожидает сборки».
 			if rs, ok, _ := realStage(p); !ok || rs < StageShipped {
@@ -838,6 +844,106 @@ func (m *Manager) Status(id string) WorkerStatus {
 		return WorkerStatus{Live: p.Live}
 	}
 	return w.Status()
+}
+
+// ResetInfo — что произойдёт при сбросе очереди (для предупреждения).
+type ResetInfo struct {
+	Zero      bool        `json:"zero"`        // будет ли обнуляться остаток
+	OnSale    []Batch     `json:"on_sale"`     // пары в продаже
+	Undeliver []ResetItem `json:"undelivered"` // заказы в работе, которые будут брошены
+	Live      bool        `json:"live"`
+}
+
+type ResetItem struct {
+	PostingNumber string    `json:"posting_number"`
+	Stage         string    `json:"stage"`
+	WindowEnd     time.Time `json:"window_end"`
+	Products      string    `json:"products"`
+}
+
+func (m *Manager) resetInfo(id string) (ResetInfo, Profile, error) {
+	p, ok := m.store.Get(id)
+	if !ok {
+		return ResetInfo{}, p, fmt.Errorf("магазин не найден")
+	}
+	info := ResetInfo{Zero: !p.KeepOnReset, Live: p.Live}
+	batches := p.Batches
+	m.mu.Lock()
+	w := m.workers[id]
+	m.mu.Unlock()
+	if w != nil { // в тестовом режиме партии в продаже — в симуляции
+		if st := w.Status(); len(st.Batches) > 0 {
+			batches = nil
+			for _, b := range st.Batches {
+				batches = append(batches, b.Batch)
+			}
+		}
+	}
+	for _, b := range batches {
+		if b.State == BatchActive || b.State == BatchNext {
+			info.OnSale = append(info.OnSale, b)
+		}
+	}
+	j := LoadJournal(m.journalPath(&p))
+	if w != nil {
+		j = w.journal // у работающей автоматизации журнал свежее, чем на диске
+	}
+	for _, e := range j.All() {
+		if e.Final == "" && e.Stage >= 0 && !e.Abandoned {
+			info.Undeliver = append(info.Undeliver, ResetItem{PostingNumber: e.PostingNumber, Stage: stageNames[e.Stage], WindowEnd: e.WindowEnd, Products: e.Products})
+		}
+	}
+	sort.Slice(info.Undeliver, func(i, j int) bool { return info.Undeliver[i].WindowEnd.Before(info.Undeliver[j].WindowEnd) })
+	return info, p, nil
+}
+
+func (m *Manager) ResetPreview(id string) (ResetInfo, error) {
+	info, _, err := m.resetInfo(id)
+	return info, err
+}
+
+// ResetQueue — «Сбросить очередь»: автоматизация выключается, пары в продаже обнуляются (если включено),
+// недоставленные заказы бросаются, список партий очищается.
+func (m *Manager) ResetQueue(ctx context.Context, id string) (info ResetInfo, warning string, err error) {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+	info, p, err := m.resetInfo(id)
+	if err != nil {
+		return info, "", err
+	}
+	m.stop(id, true)
+	log := m.Log(id)
+	var errs []string
+	if info.Zero && p.WarehouseID != 0 {
+		c := NewClient(&p, m.mocks)
+		c.readOnly = !p.Live
+		w := NewWorker(p, c, LoadJournal(m.journalPath(&p)), log)
+		for i := range info.OnSale {
+			if err := w.setPairStock(ctx, &info.OnSale[i], 0); err != nil {
+				errs = append(errs, fmt.Sprintf("SKU %d + %d: %v", info.OnSale[i].SKU1, info.OnSale[i].SKU2, err))
+			}
+		}
+	}
+	j := LoadJournal(m.journalPath(&p))
+	now := time.Now()
+	for _, e := range j.All() {
+		if e.Final == "" && e.Stage >= 0 && !e.Abandoned {
+			e.Abandoned, e.Final, e.FinalAt, e.DueAt = true, "брошен при сбросе очереди", now, time.Time{}
+		}
+	}
+	j.MarkDirty()
+	j.Save()
+	m.store.Update(id, func(pp *Profile) { pp.Batches, pp.Running = nil, false })
+	log.Add("warn", "Очередь сброшена: партий больше нет, автоматизация выключена. Брошено недоставленных заказов: %d.%s",
+		len(info.Undeliver), map[bool]string{true: " Остаток пар в продаже обнулён.", false: ""}[info.Zero && len(info.OnSale) > 0])
+	for _, u := range info.Undeliver {
+		log.Add("warn", "Заказ %s брошен (этап «%s», окно до %s) — статусы больше не меняются, переведите его вручную.", u.PostingNumber, u.Stage, u.WindowEnd.Local().Format("02.01 15:04"))
+	}
+	if len(errs) > 0 {
+		warning = "Очередь сброшена, но остаток обнулить не удалось: " + strings.Join(errs, "; ") + ". Обнулите его вручную в кабинете Ozon."
+		log.Add("err", "%s", warning)
+	}
+	return info, warning, nil
 }
 
 // SwitchNext — кнопка «Следующая партия».
