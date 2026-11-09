@@ -44,6 +44,7 @@ type MockOzon struct {
 	seq           int
 	Calls         map[string]int  // сколько раз вызван каждый метод
 	Fail          map[string]bool // принудительная ошибка метода (для тестов)
+	BadPostings   map[string]bool // отправления, из-за которых Ozon отклоняет весь запрос (для тестов)
 	LastMileState [2]string       // статус/подстатус после «курьер в пути»
 	// Окно доставки демо-заказа относительно момента заказа.
 	WindowStart, WindowEnd time.Duration
@@ -293,6 +294,14 @@ func (m *MockOzon) Handle(path string, body []byte) (int, any) {
 		p.Status, p.Substatus = "awaiting_deliver", "posting_awaiting_passport_data"
 		return 200, map[string]any{"result": []string{pn}}
 	case "/v2/fbs/posting/delivering", "/v2/fbs/posting/last-mile", "/v2/fbs/posting/delivered":
+		if n := len(toStrList(req["posting_number"])); n < 1 || n > 20 {
+			return errResp(400, "invalid PostingNumber: value must contain between 1 and 20 items, inclusive")
+		}
+		for _, pn := range toStrList(req["posting_number"]) {
+			if m.BadPostings[pn] {
+				return errResp(400, "демо: отправление "+pn+" нельзя перевести")
+			}
+		}
 		var res []any
 		for _, pn := range toStrList(req["posting_number"]) {
 			p := m.find(pn)

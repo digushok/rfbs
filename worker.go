@@ -132,8 +132,10 @@ type SkipView struct {
 var listStatuses = []string{"awaiting_packaging", "awaiting_deliver", "delivering", "driver_pickup"}
 
 const (
-	batchSize     = 50        // отправлений в одном запросе смены статуса
-	recheckEvery  = time.Hour // как часто перепроверять заказ, пропавший из списков (и всегда — когда подошёл шаг)
+	batchSize     = 20               // отправлений в одном запросе смены статуса (ограничение Ozon: от 1 до 20)
+	slotGap       = 10 * time.Second // расписание «Условно доставлен»: пачки к одному сроку идут с таким шагом
+	deadlineRetry = 15 * time.Second // повтор «Условно доставлен» после ошибки — быстро, у него есть срок
+	recheckEvery  = time.Hour        // как часто перепроверять заказ, пропавший из списков (и всегда — когда подошёл шаг)
 	maxRetryDelay = 10 * time.Minute
 )
 
@@ -184,6 +186,13 @@ func (w *Worker) now() time.Time {
 }
 
 func (w *Worker) Start() {
+	// После перезапуска не ждём паузы прошлых ошибок — пробуем сразу.
+	for _, e := range w.journal.All() {
+		if e.Final == "" && !e.NextTry.IsZero() {
+			e.NextTry = time.Time{}
+			w.journal.MarkDirty()
+		}
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	w.cancel = cancel
 	w.done = make(chan struct{})
@@ -407,6 +416,7 @@ func (w *Worker) Tick(ctx context.Context) time.Time {
 			pend = append(pend, a)
 		}
 	}
+	pend = append(pend, w.planDelivered(now)...)
 	w.execute(ctx, pend, now)
 	w.manageBatches(ctx, now)
 	w.flushBatches()
@@ -486,14 +496,65 @@ func (w *Worker) update(p *Posting, now time.Time, batchID string, noCount bool)
 	} else if !w.prof.Live && e.Stage > rs {
 		e.Warning = "этапы после «" + stageNames[rs] + "» выполнены только в тесте"
 	}
+	if next == StageDelivered {
+		return pendingAction{}, false // время «Условно доставлен» назначает planDelivered — для всех заказов сразу
+	}
 	if due.IsZero() || due.After(now) || now.Before(e.NextTry) {
 		return pendingAction{}, false
 	}
-	if next == StageDelivered && !end.IsZero() && now.After(end) {
-		w.logOnce("late|"+p.PostingNumber, "warn", "Заказ %s: окно доставки уже закончилось (%s), перевожу в «Условно доставлен» сразу.",
-			p.PostingNumber, end.Local().Format("02.01 15:04"))
-	}
 	return pendingAction{p: p, e: e, next: next}, true
+}
+
+// planDelivered — расписание «Условно доставлен» для всех заказов, которые его ждут.
+// Каждый заказ — как можно позже (конец окна минус запас), но в одном запросе Ozon принимает не больше 20 заказов,
+// поэтому, если к одному сроку их больше, расписание строится от конца: последняя пачка уходит ровно в срок,
+// каждая предыдущая — на slotGap раньше. Так последний заказ переводится в крайнее время, а все успевают.
+func (w *Worker) planDelivered(now time.Time) []pendingAction {
+	type item struct {
+		e      *JEntry
+		target time.Time
+	}
+	var items []item
+	for _, e := range w.journal.All() {
+		if e.Final != "" || e.Abandoned || e.Stage != StageLastMile || e.SeenAt.Before(now) {
+			continue // только заказы, данные по которым получены в этом цикле
+		}
+		t, warn := w.dueFor(StageDelivered, e, now)
+		if warn != "" || t.IsZero() {
+			continue
+		}
+		items = append(items, item{e, t})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].target.After(items[j].target) })
+	var slot time.Time
+	inSlot := 0
+	var pend []pendingAction
+	for _, it := range items {
+		switch {
+		case slot.IsZero() || it.target.Before(slot):
+			slot, inSlot = it.target, 0
+		case inSlot >= batchSize:
+			slot, inSlot = slot.Add(-slotGap), 0
+		}
+		inSlot++
+		due := slot
+		if due.Before(now) {
+			due = now
+		}
+		it.e.DueAt = due
+		if due.After(now) || now.Before(it.e.NextTry) {
+			continue
+		}
+		if !it.e.WindowEnd.IsZero() && now.After(it.e.WindowEnd) {
+			w.logOnce("late|"+it.e.PostingNumber, "warn", "Заказ %s: окно доставки уже закончилось (%s), перевожу в «Условно доставлен» сразу.",
+				it.e.PostingNumber, it.e.WindowEnd.Local().Format("02.01 15:04"))
+		}
+		pend = append(pend, pendingAction{p: &Posting{PostingNumber: it.e.PostingNumber}, e: it.e, next: StageDelivered})
+	}
+	if len(items) > 0 {
+		w.journal.MarkDirty()
+	}
+	return pend
 }
 
 // syncManual поднимает этап по данным Ozon. Этапы, которые программа не выполняла, помечаются как ручные.
@@ -591,12 +652,28 @@ func (w *Worker) execute(ctx context.Context, pend []pendingAction, now time.Tim
 				pns[k] = a.p.PostingNumber
 			}
 			res, err := w.client.SetStatusBatch(ctx, actionPaths[next], pns)
-			for _, a := range chunk {
-				if err != nil {
-					w.result(a, err, now)
-				} else {
-					w.result(a, res[a.p.PostingNumber], now)
+			var oe *OzonError
+			if err != nil && len(chunk) > 1 && errors.As(err, &oe) && oe.Status >= 400 && oe.Status < 500 && oe.Status != 429 {
+				// Ozon отклонил пачку целиком — отправляем по одному, чтобы один заказ не держал остальные.
+				w.log.Add("warn", "Ozon отклонил пачку «%s» из %d заказов (%v) — отправляю по одному.", actionNames[next], len(chunk), err)
+				for _, a := range chunk {
+					if ctx.Err() != nil {
+						return
+					}
+					w.result(a, w.client.SetStatus(ctx, actionPaths[next], a.p.PostingNumber), now)
 				}
+				continue
+			}
+			if err != nil {
+				for _, a := range chunk {
+					w.fail(a, err, now, true)
+				}
+				w.log.Add("err", "Не удалось «%s» для %d заказов (%s): %v. Повтор через %s.", actionNames[next], len(chunk),
+					strings.Join(pns, ", "), err, chunk[0].e.NextTry.Sub(now).Round(time.Second))
+				continue
+			}
+			for _, a := range chunk {
+				w.result(a, res[a.p.PostingNumber], now)
 			}
 		}
 	}
@@ -626,16 +703,28 @@ func (w *Worker) result(a pendingAction, err error, now time.Time) {
 		w.log.Add("ok", "Заказ %s: «%s» — выполнено.", a.p.PostingNumber, name)
 		return
 	}
+	w.fail(a, err, now, false)
+}
+
+// fail записывает ошибку шага и время повтора. quiet — без строки в журнале (её пишет вызывающий за всю пачку).
+func (w *Worker) fail(a pendingAction, err error, now time.Time, quiet bool) {
 	if errors.Is(err, context.Canceled) {
 		return
 	}
+	name := actionNames[a.next]
 	e := a.e
 	e.Fails++
 	e.LastError = fmt.Sprintf("«%s»: %v", name, err)
-	e.NextTry = now.Add(retryDelay(e.Fails))
+	delay := retryDelay(e.Fails)
+	if a.next == StageDelivered {
+		delay = deadlineRetry // у «Условно доставлен» есть срок — повторяем быстро
+	}
+	e.NextTry = now.Add(delay)
 	w.journal.MarkDirty()
-	w.log.Add("err", "Заказ %s: не удалось «%s» (попытка %d, повтор через %s): %v", a.p.PostingNumber, name, e.Fails,
-		e.NextTry.Sub(now).Round(time.Second), err)
+	if !quiet {
+		w.log.Add("err", "Заказ %s: не удалось «%s» (попытка %d, повтор через %s): %v", a.p.PostingNumber, name, e.Fails,
+			delay.Round(time.Second), err)
+	}
 	// Если «Курьер в пути» стабильно не принимается (например, уже выставлен вручную), идём дальше.
 	if a.next == StageLastMile && e.Fails >= 3 {
 		w.log.Add("warn", "Заказ %s: считаю этап «Курьер в пути» выполненным и перехожу к ожиданию конца окна.", a.p.PostingNumber)
@@ -672,7 +761,7 @@ func (w *Worker) buildViews(now time.Time) ([]PostingView, time.Time) {
 			// план оставшихся шагов
 			t := due
 			for i := e.Stage + 1; i <= StageDelivered && !t.IsZero(); i++ {
-				if i == StageDelivered && !e.WindowEnd.IsZero() {
+				if i == StageDelivered && i > e.Stage+1 && !e.WindowEnd.IsZero() {
 					if dt := e.WindowEnd.Add(-time.Duration(w.prof.MarginMin) * time.Minute); dt.After(t) {
 						t = dt
 					}

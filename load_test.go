@@ -56,6 +56,7 @@ func runLoad(t *testing.T, lastMile [2]string) {
 		ck.add(wait + 700*time.Millisecond) // плюс время на сами запросы
 	}
 	targets, late, early, notDone := 0, 0, 0, 0
+	byEnd := map[time.Time][]time.Time{} // конец окна → когда переведены
 	for _, p := range m.postings {
 		if checkTarget(p, &prof) != "" {
 			if p.Status != "awaiting_packaging" {
@@ -73,18 +74,34 @@ func runLoad(t *testing.T, lastMile [2]string) {
 		if at.After(wEnd) {
 			late++
 		}
-		if at.Before(wEnd.Add(-3*time.Minute - 5*time.Second)) {
-			early++
+		byEnd[wEnd] = append(byEnd[wEnd], at)
+	}
+	// Расписание от конца: пачки по 20, последняя — в срок (конец окна − 3 мин), каждая предыдущая на 10 с раньше.
+	for end, ats := range byEnd {
+		target := end.Add(-3 * time.Minute)
+		earliest := target.Add(-time.Duration((len(ats)+19)/20) * slotGap)
+		last := ats[0]
+		for _, at := range ats {
+			if at.Before(earliest.Add(-5 * time.Second)) {
+				early++
+			}
+			if at.After(last) {
+				last = at
+			}
+		}
+		if last.Before(target) || last.After(target.Add(5*time.Second)) {
+			t.Fatalf("окно до %s: последний заказ должен уйти в срок %s, а ушёл %s (заказов %d)",
+				end.Format("15:04"), target.Format("15:04:05"), last.Format("15:04:05"), len(ats))
 		}
 	}
-	t.Logf("заказов: %d, целевых: %d, циклов: %d, запросов: %v", len(m.postings), targets, ticks, m.Calls)
+	t.Logf("заказов: %d, целевых: %d, циклов: %d, сроков: %d, запросов: %v", len(m.postings), targets, ticks, len(byEnd), m.Calls)
 	if len(m.postings) < 1150 {
 		t.Fatalf("мало заказов: %d", len(m.postings))
 	}
 	if notDone > 0 || late > 0 || early > 0 {
-		t.Fatalf("не доставлено: %d, опоздали: %d, слишком рано: %d", notDone, late, early)
+		t.Fatalf("не доставлено: %d, опоздали: %d, раньше расписания: %d", notDone, late, early)
 	}
-	if n := m.Calls["/v2/fbs/posting/delivered"]; n > targets/10 {
+	if n, want := m.Calls["/v2/fbs/posting/delivered"], (targets+19)/20+len(byEnd); n > want {
 		t.Fatalf("«доставлено» не объединяется в пачки: %d запросов на %d заказов", n, targets)
 	}
 }
