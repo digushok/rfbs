@@ -55,32 +55,39 @@ func realStage(p *Posting) (stage int, ok bool, final string) {
 
 // checkTarget возвращает "" для целевого заказа или причину пропуска.
 func checkTarget(p *Posting, prof *Profile) string {
+	_, reason := targetBatch(p, prof)
+	return reason
+}
+
+// targetBatch — партия, к которой подходит заказ: склад, ровно 2 SKU по 1 шт., пара из начатой партии.
+func targetBatch(p *Posting, prof *Profile) (string, string) {
 	wh := p.DeliveryMethod.WarehouseID
 	if wh == 0 && p.AnalyticsData != nil {
 		wh = p.AnalyticsData.WarehouseID
 	}
 	if wh != prof.WarehouseID {
-		return fmt.Sprintf("другой склад (%d)", wh)
+		return "", fmt.Sprintf("другой склад (%d)", wh)
 	}
 	if len(p.Products) != 2 {
-		return fmt.Sprintf("в заказе %d поз., нужно ровно 2", len(p.Products))
+		return "", fmt.Sprintf("в заказе %d поз., нужно ровно 2", len(p.Products))
 	}
-	got := map[int64]int{}
 	for _, pr := range p.Products {
-		got[pr.SKU] += pr.Quantity
 		if pr.Quantity != 1 {
-			return fmt.Sprintf("SKU %d в количестве %d шт., нужно 1", pr.SKU, pr.Quantity)
+			return "", fmt.Sprintf("SKU %d в количестве %d шт., нужно 1", pr.SKU, pr.Quantity)
 		}
 	}
-	if len(got) != 2 || got[prof.SKU1] != 1 || got[prof.SKU2] != 1 {
-		var s []string
-		for k := range got {
-			s = append(s, fmt.Sprint(k))
-		}
-		sort.Strings(s)
-		return "другой состав: SKU " + strings.Join(s, ", ")
+	a, c := p.Products[0].SKU, p.Products[1].SKU
+	if a == c {
+		return "", fmt.Sprintf("SKU %d дважды", a)
 	}
-	return ""
+	for i := range prof.Batches {
+		if b := &prof.Batches[i]; b.Started() && b.Matches(a, c) {
+			return b.ID, ""
+		}
+	}
+	s := []string{fmt.Sprint(a), fmt.Sprint(c)}
+	sort.Strings(s)
+	return "", "другой состав: SKU " + strings.Join(s, ", ") + " (нет такой начатой партии)"
 }
 
 type PostingView struct {
@@ -98,6 +105,7 @@ type PostingView struct {
 	NextAt        time.Time    `json:"next_at"`
 	Warning       string       `json:"warning,omitempty"`
 	Error         string       `json:"error,omitempty"`
+	Batch         int          `json:"batch,omitempty"` // номер партии
 }
 
 type SkipView struct {
@@ -134,14 +142,24 @@ type Worker struct {
 	lastErr   string
 	views     []PostingView
 	skipped   []SkipView
+	bviews    []BatchView
 	loggedFor map[string]bool // что уже записано в лог, чтобы не повторяться
 	badStatus map[string]bool // статусы, которые Ozon не принимает в фильтре
+
+	store       *Store           // откуда читать партии (nil в тестах — берутся из prof)
+	sim         map[string]Batch // тестовый режим: симулированное состояние партий (в настройки не пишется)
+	bt          []Batch          // партии на время цикла
+	btDirty     map[string]bool
+	switchReq   bool // вручную: перейти к следующей партии
+	activateAt  time.Time
+	productInfo map[int64]*ProductInfo
 }
 
 func NewWorker(prof Profile, client *Client, journal *Journal, log *ShopLog) *Worker {
 	client.readOnly = !prof.Live
 	return &Worker{prof: prof, client: client, journal: journal, log: log, clock: time.Now,
-		kick: make(chan struct{}, 1), loggedFor: map[string]bool{}, badStatus: map[string]bool{}}
+		kick: make(chan struct{}, 1), loggedFor: map[string]bool{}, badStatus: map[string]bool{},
+		sim: map[string]Batch{}, btDirty: map[string]bool{}, productInfo: map[int64]*ProductInfo{}}
 }
 
 // now — текущее время по часам Ozon (часы компьютера + измеренная разница).
@@ -162,8 +180,8 @@ func (w *Worker) Start() {
 	if w.prof.Live {
 		mode = "БОЕВОЙ режим: статусы в Ozon меняются по-настоящему"
 	}
-	w.log.Add("info", "Автоматизация запущена. %s. Склад %d, SKU %d + %d, пауза %d сек, запас %d мин.",
-		mode, w.prof.WarehouseID, w.prof.SKU1, w.prof.SKU2, w.prof.PauseSec, w.prof.MarginMin)
+	w.log.Add("info", "Автоматизация запущена. %s. Склад %d, партий: %d, пауза %d сек, запас %d мин.",
+		mode, w.prof.WarehouseID, len(w.prof.Batches), w.prof.PauseSec, w.prof.MarginMin)
 	go func() {
 		defer close(w.done)
 		for {
@@ -339,36 +357,47 @@ func (w *Worker) Tick(ctx context.Context) time.Time {
 		w.logOnce("clock", "warn", "Часы компьютера расходятся с Ozon на %s. Программа учитывает разницу, но лучше включить синхронизацию времени в Windows.", off.Round(time.Second))
 	}
 
+	w.loadBatches()
 	var skipped []SkipView
 	var pend []pendingAction
 	for _, p := range postings {
 		if ctx.Err() != nil {
 			return time.Time{}
 		}
-		if reason := checkTarget(p, &w.prof); reason != "" {
+		batchID, reason := targetBatch(p, &w.prof)
+		if reason != "" {
+			// Заказ, который программа уже взяла в работу (например, партию потом удалили), доводим до конца.
+			if e := w.journal.Peek(p.PostingNumber); e != nil && e.Stage >= 0 {
+				reason, batchID = "", e.Batch
+			}
+		}
+		if reason != "" {
 			if _, ok, final := realStage(p); ok && final == "" && len(skipped) < 300 {
 				skipped = append(skipped, SkipView{PostingNumber: p.PostingNumber, Status: p.Status, Reason: reason, Created: p.InProcessAt.Time, Products: productsText(p)})
 			}
 			w.logOnce("skip|"+p.PostingNumber, "info", "Заказ %s пропущен — не целевой: %s.", p.PostingNumber, reason)
 			continue
 		}
-		if a, ok := w.update(p, now); ok {
+		if a, ok := w.update(p, now, batchID); ok {
 			pend = append(pend, a)
 		}
 	}
 	w.execute(ctx, pend, now)
+	w.manageBatches(ctx, now)
+	w.flushBatches()
 	w.journal.Save()
 
 	views, nextDue := w.buildViews(now)
 	sort.Slice(skipped, func(i, j int) bool { return skipped[i].Created.After(skipped[j].Created) })
+	bv := w.batchViews()
 	w.mu.Lock()
-	w.views, w.skipped = views, skipped
+	w.views, w.skipped, w.bviews = views, skipped, bv
 	w.mu.Unlock()
 	return nextDue
 }
 
 // update синхронизирует запись журнала с данными Ozon и решает, пора ли делать следующий шаг.
-func (w *Worker) update(p *Posting, now time.Time) (pendingAction, bool) {
+func (w *Worker) update(p *Posting, now time.Time, batchID string) (pendingAction, bool) {
 	begin, end := p.Window()
 	e := w.journal.Get(p.PostingNumber)
 	e.SeenAt, e.OrderNumber, e.Products, e.Status = now, p.OrderNumber, productsText(p), p.Status
@@ -381,6 +410,14 @@ func (w *Worker) update(p *Posting, now time.Time) (pendingAction, bool) {
 	rs, ok, final := realStage(p)
 	if ok && rs > e.Stage {
 		e.Stage = rs
+	}
+	if e.Batch == "" && batchID != "" && final == "" {
+		e.Batch = batchID
+		w.addSold(batchID, 1)
+	}
+	if final == "отменён" && e.Batch != "" && !e.Uncounted {
+		e.Uncounted = true
+		w.addSold(e.Batch, -1)
 	}
 	if final != "" {
 		if e.Final == "" {
@@ -550,7 +587,8 @@ func (w *Worker) buildViews(now time.Time) ([]PostingView, time.Time) {
 			continue
 		}
 		v := PostingView{PostingNumber: e.PostingNumber, OrderNumber: e.OrderNumber, Created: e.Created, Status: e.Status,
-			Stage: e.Stage, Final: e.Final, WindowBegin: e.WindowBegin, WindowEnd: e.WindowEnd, Warning: e.Warning, Error: e.LastError}
+			Stage: e.Stage, Final: e.Final, WindowBegin: e.WindowBegin, WindowEnd: e.WindowEnd, Warning: e.Warning, Error: e.LastError,
+			Batch: w.num(e.Batch)}
 		for i := 0; i <= StageDelivered; i++ {
 			v.Done[i] = e.Stage >= 0 && i <= e.Stage
 			v.Plan[i] = e.DoneAt[i]
@@ -612,6 +650,7 @@ type WorkerStatus struct {
 	NextPoll time.Time     `json:"next_poll"`
 	LastErr  string        `json:"last_error"`
 	Postings []PostingView `json:"postings"`
+	Batches  []BatchView   `json:"batches"`
 	Skipped  []SkipView    `json:"skipped"`
 }
 
@@ -619,7 +658,7 @@ func (w *Worker) Status() WorkerStatus {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return WorkerStatus{Running: true, Live: w.prof.Live, Started: w.started, LastPoll: w.lastPoll, NextPoll: w.nextPoll,
-		LastErr: w.lastErr, Postings: w.views, Skipped: w.skipped}
+		LastErr: w.lastErr, Postings: w.views, Skipped: w.skipped, Batches: w.bviews}
 }
 
 // ---------- управление работниками всех магазинов ----------
@@ -674,6 +713,7 @@ func (m *Manager) start(id string) error {
 	}
 	m.stop(id, false)
 	w := NewWorker(p, NewClient(&p, m.mocks), LoadJournal(m.journalPath(&p)), m.Log(id))
+	w.store = m.store
 	m.mu.Lock()
 	m.workers[id] = w
 	m.mu.Unlock()
@@ -736,6 +776,18 @@ func (m *Manager) Status(id string) WorkerStatus {
 	return w.Status()
 }
 
+// SwitchNext — кнопка «Следующая партия».
+func (m *Manager) SwitchNext(id string) error {
+	m.mu.Lock()
+	w := m.workers[id]
+	m.mu.Unlock()
+	if w == nil {
+		return fmt.Errorf("запустите автоматизацию — переключение партий выполняет она")
+	}
+	w.RequestSwitch()
+	return nil
+}
+
 func (m *Manager) Kick(id string) {
 	m.mu.Lock()
 	w := m.workers[id]
@@ -773,7 +825,7 @@ func (m *Manager) ResetTest(id string) error {
 	return err
 }
 
-// ApplyStock выставляет одинаковый остаток обоим SKU (в тестовом режиме только описывает действие).
+// ApplyStock заново выставляет остаток активной партии (в тестовом режиме только описывает действие).
 func (m *Manager) ApplyStock(ctx context.Context, id string, qty int) ([]string, error) {
 	p, ok := m.store.Get(id)
 	if !ok {
@@ -785,34 +837,18 @@ func (m *Manager) ApplyStock(ctx context.Context, id string, qty int) ([]string,
 	if qty < 0 {
 		return nil, fmt.Errorf("количество не может быть отрицательным")
 	}
-	m.store.Update(id, func(pp *Profile) { pp.StockQty = qty })
+	b := p.ActiveBatch()
+	if b == nil {
+		return nil, fmt.Errorf("нет активной партии — запустите автоматизацию, она выставит остаток первой партии сама")
+	}
 	c := NewClient(&p, m.mocks)
 	c.readOnly = !p.Live
-	log := m.Log(id)
-	infos, err := c.ProductsBySKU(ctx, []int64{p.SKU1, p.SKU2})
-	if err != nil {
-		return nil, err
-	}
+	w := NewWorker(p, c, LoadJournal(m.journalPath(&p)), m.Log(id))
 	var msgs []string
-	for _, sku := range []int64{p.SKU1, p.SKU2} {
-		pi := infos[sku]
-		if pi == nil {
-			return msgs, fmt.Errorf("товар с SKU %d не найден в магазине", sku)
-		}
-		if !p.Live {
-			s := fmt.Sprintf("[ТЕСТ] Выставил бы остаток %d шт. для SKU %d (артикул «%s», product_id %d) на складе %d. В Ozon ничего не отправлено.",
-				qty, sku, pi.OfferID, pi.ProductID, p.WarehouseID)
-			log.Add("test", "%s", s)
-			msgs = append(msgs, s)
-			continue
-		}
-		if err := c.SetStock(ctx, p.WarehouseID, pi, qty); err != nil {
-			log.Add("err", "Остаток SKU %d: ошибка: %v", sku, err)
-			return msgs, fmt.Errorf("SKU %d: %v", sku, err)
-		}
-		s := fmt.Sprintf("Остаток SKU %d (артикул «%s») на складе %d: %d шт.", sku, pi.OfferID, p.WarehouseID, qty)
-		log.Add("ok", "%s", s)
-		msgs = append(msgs, s)
+	seq := m.Log(id).LastSeq()
+	err := w.setPairStock(ctx, b, qty)
+	for _, ln := range m.Log(id).Since(seq) {
+		msgs = append(msgs, ln.Text)
 	}
-	return msgs, nil
+	return msgs, err
 }

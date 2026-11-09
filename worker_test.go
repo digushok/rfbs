@@ -156,7 +156,7 @@ func TestResumeFromOzonStatus(t *testing.T) {
 }
 
 func TestCheckTarget(t *testing.T) {
-	prof := &Profile{WarehouseID: 1, SKU1: 10, SKU2: 20}
+	prof := &Profile{WarehouseID: 1, Batches: []Batch{{ID: "a", SKU1: 10, SKU2: 20, State: BatchActive}, {ID: "q", SKU1: 30, SKU2: 40, State: BatchQueued}}}
 	mk := func(wh int64, prods ...PostingProduct) *Posting {
 		p := &Posting{Products: prods}
 		p.DeliveryMethod.WarehouseID = wh
@@ -174,6 +174,7 @@ func TestCheckTarget(t *testing.T) {
 		{mk(1, PostingProduct{SKU: 10, Quantity: 1}), false},
 		{mk(1, PostingProduct{SKU: 10, Quantity: 1}, PostingProduct{SKU: 20, Quantity: 1}, PostingProduct{SKU: 30, Quantity: 1}), false},
 		{mk(1, PostingProduct{SKU: 10, Quantity: 1}, PostingProduct{SKU: 30, Quantity: 1}), false},
+		{mk(1, PostingProduct{SKU: 30, Quantity: 1}, PostingProduct{SKU: 40, Quantity: 1}), false}, // партия ещё в очереди
 	}
 	for i, c := range cases {
 		if got := checkTarget(c.p, prof) == ""; got != c.ok {
@@ -190,6 +191,10 @@ func TestStockApply(t *testing.T) {
 	active, _ := store.Snapshot()
 	m := mocks.Get(active)
 	m.OrderEvery = 0
+	if _, err := mgr.ApplyStock(context.Background(), active, 9); err == nil {
+		t.Fatalf("без активной партии остаток выставлять нельзя")
+	}
+	store.Update(active, func(p *Profile) { p.Batches[0].State = BatchActive })
 	// Тест: остатки не меняются.
 	if _, err := mgr.ApplyStock(context.Background(), active, 9); err != nil {
 		t.Fatal(err)

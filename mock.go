@@ -19,6 +19,10 @@ const (
 	mockWarehouseName       = "Демо-склад rFBS (Москва)"
 	mockSKU1          int64 = 5980291763
 	mockSKU2          int64 = 5980291764
+	mockSKU3          int64 = 5980291771
+	mockSKU4          int64 = 5980291772
+	mockSKU5          int64 = 5980291781
+	mockSKU6          int64 = 5980291782
 	mockSKUOther      int64 = 1234567890
 )
 
@@ -55,6 +59,10 @@ func NewMockOzon(now func() time.Time) *MockOzon {
 		{mockSKU1, 811001, "CASE-BLACK-01", "Чехол для телефона, чёрный"},
 		{mockSKU2, 811002, "GLASS-01", "Защитное стекло"},
 		{mockSKUOther, 811003, "CABLE-USB-C", "Кабель USB-C, 1 м"},
+		{mockSKU3, 811004, "CASE-BLUE-02", "Чехол для телефона, синий"},
+		{mockSKU4, 811005, "GLASS-02", "Защитное стекло, матовое"},
+		{mockSKU5, 811006, "CASE-RED-03", "Чехол для телефона, красный"},
+		{mockSKU6, 811007, "GLASS-03", "Защитное стекло, с рамкой"},
 	}
 	m.stock[mockSKU1], m.stock[mockSKU2], m.stock[mockSKUOther] = 5, 5, 50
 	m.nextOrder = now().Add(20 * time.Second)
@@ -89,21 +97,22 @@ func (m *MockOzon) AddPosting(kind string) *Posting {
 		pr := m.prod(sku)
 		p.Products = append(p.Products, PostingProduct{SKU: sku, Name: pr.Name, OfferID: pr.OfferID, Quantity: q})
 	}
+	a, b := m.targetPair()
 	switch kind {
 	case "target":
-		add(mockSKU1, 1)
-		add(mockSKU2, 1)
+		add(a, 1)
+		add(b, 1)
 	case "single":
-		add(mockSKU1, 1)
+		add(a, 1)
 	case "double":
-		add(mockSKU1, 2)
-		add(mockSKU2, 1)
+		add(a, 2)
+		add(b, 1)
 	case "other_wh":
-		add(mockSKU1, 1)
-		add(mockSKU2, 1)
+		add(a, 1)
+		add(b, 1)
 		p.DeliveryMethod.WarehouseID = mockWarehouseID + 1
 	default:
-		add(mockSKU1, 1)
+		add(a, 1)
 		add(mockSKUOther, 1)
 	}
 	for _, pr := range p.Products {
@@ -130,12 +139,22 @@ func (m *MockOzon) generate() {
 			kinds = []string{"target", "target", "target", "target", "other"}
 		}
 		k := kinds[m.rnd.Intn(len(kinds))]
-		if k == "target" && (m.stock[mockSKU1] <= 0 || m.stock[mockSKU2] <= 0) {
+		if a, b := m.targetPair(); k == "target" && (m.stock[a] <= 0 || m.stock[b] <= 0) {
 			k = "other"
 		}
 		m.AddPosting(k)
 		m.nextOrder = m.nextOrder.Add(m.OrderEvery + time.Duration(m.rnd.Intn(30))*time.Second)
 	}
+}
+
+// targetPair — демо-пара, у которой сейчас есть остаток (покупатели заказывают то, что в наличии).
+func (m *MockOzon) targetPair() (int64, int64) {
+	for _, pr := range [][2]int64{{mockSKU1, mockSKU2}, {mockSKU3, mockSKU4}, {mockSKU5, mockSKU6}} {
+		if m.stock[pr[0]] > 0 && m.stock[pr[1]] > 0 {
+			return pr[0], pr[1]
+		}
+	}
+	return mockSKU1, mockSKU2
 }
 
 func (m *MockOzon) find(pn string) *Posting {

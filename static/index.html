@@ -33,24 +33,30 @@
     <div id="liveNote" class="banner err hidden"><b>Боевой режим.</b> Программа по-настоящему меняет статусы заказов и остатки в Ozon.</div>
 
     <div class="card">
-      <div class="card-h"><span class="step">1</span><div><h2>Склад и товары</h2><p class="sub">Целевой заказ: оба SKU по 1 шт. с этого склада, и больше ничего</p></div></div>
-      <div class="form3">
-        <label class="fld">Склад
-          <div class="row tight"><select id="whSel" class="grow"></select><button class="btn ghost sm" id="whReload" title="Загрузить склады из Ozon">↻</button></div>
-        </label>
-        <label class="fld">SKU Ozon № 1<input id="sku1" inputmode="numeric" placeholder="например, 5980291763"></label>
-        <label class="fld">SKU Ozon № 2<input id="sku2" inputmode="numeric" placeholder="SKU второго товара"></label>
+      <div class="card-h"><span class="step">1</span><div><h2>Склад</h2><p class="sub">Один склад для всех партий</p></div></div>
+      <div class="row tight wh">
+        <select id="whSel" class="grow"></select>
+        <button class="btn ghost sm" id="whReload" title="Загрузить склады из Ozon">↻</button>
+        <button class="btn primary" id="cfgSave">Сохранить</button><span id="cfgMsg" class="muted"></span>
       </div>
-      <div id="prodInfo" class="prods"></div>
-      <div class="row"><button class="btn primary" id="cfgSave">Сохранить</button><span id="cfgMsg" class="muted"></span></div>
     </div>
 
     <div class="card">
-      <div class="card-h"><span class="step">2</span><div><h2>Остатки</h2><p class="sub">Один раз выставляет одинаковый остаток обоим SKU на выбранном складе</p></div></div>
-      <div class="row">
-        <label class="fld inline">Количество каждого SKU, шт.<input type="number" id="stockQty" min="0" class="w110"></label>
-        <button class="btn primary" id="stockApply">Выставить остатки</button>
-        <button class="btn ghost" id="stockReload">↻ Обновить текущие</button>
+      <div class="card-h"><span class="step">2</span><div><h2>Партии</h2><p class="sub">Пары SKU по очереди. Целевой заказ — ровно эти 2 SKU по 1 шт. Когда партия распродана, программа сама запускает следующую: выставляет ей остаток</p></div>
+        <div class="actions">
+          <button class="btn soft" id="batchAdd">+ Партия</button>
+          <button class="btn ghost" id="batchNext" title="Завершить текущую партию и запустить следующую из очереди">Следующая партия →</button>
+        </div>
+      </div>
+      <div class="scroll"><table class="grid batches" id="batchTable">
+        <thead><tr><th style="width:44px">№</th><th>SKU 1</th><th>SKU 2</th><th class="r" style="width:110px">Кол-во, шт.</th><th style="width:300px">Состояние</th><th style="width:120px"></th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <div class="row wrap">
+        <button class="btn primary hidden" id="batchSave">Сохранить очередь</button>
+        <span id="batchDirty" class="chip warn hidden">очередь изменена — не забудьте сохранить</span>
+        <label class="switch"><input type="checkbox" id="zeroOld"> Обнулять остаток старой пары при переключении</label>
+        <button class="btn ghost sm" id="stockApply" title="Ещё раз выставить остаток активной партии">Выставить остаток активной партии заново</button>
       </div>
       <div id="stockMsg" class="msgs"></div>
     </div>

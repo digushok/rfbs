@@ -22,9 +22,12 @@ type Profile struct {
 
 	WarehouseID   int64  `json:"warehouse_id"`
 	WarehouseName string `json:"warehouse_name"`
-	SKU1          int64  `json:"sku1"`
-	SKU2          int64  `json:"sku2"`
-	StockQty      int    `json:"stock_qty"`
+	// Партии — пары SKU по очереди. Старые поля SKU1/SKU2/StockQty — только для перехода с версий до 1.2.
+	Batches      []Batch `json:"batches"`
+	KeepOldStock bool    `json:"keep_old_stock"` // false (по умолчанию) — обнулять остаток старой пары при переключении
+	SKU1         int64   `json:"sku1,omitempty"`
+	SKU2         int64   `json:"sku2,omitempty"`
+	StockQty     int     `json:"stock_qty,omitempty"`
 
 	Live         bool `json:"live"`          // false — тестовый режим
 	PauseSec     int  `json:"pause_sec"`     // пауза между шагами
@@ -34,7 +37,55 @@ type Profile struct {
 	Running      bool `json:"running"`       // автоматизация включена (восстанавливается после перезапуска)
 }
 
+// Состояния партии.
+const (
+	BatchQueued = "queued" // в очереди
+	BatchActive = "active" // продаётся сейчас
+	BatchDone   = "done"   // распродана или переключена: заказы доводятся до конца, новые не ждём
+)
+
+type Batch struct {
+	ID         string    `json:"id"`
+	SKU1       int64     `json:"sku1"`
+	SKU2       int64     `json:"sku2"`
+	Qty        int       `json:"qty"`  // сколько комплектов выставить
+	Sold       int       `json:"sold"` // сколько целевых заказов пришло (без отменённых)
+	State      string    `json:"state"`
+	StartedAt  time.Time `json:"started_at"`
+	FinishedAt time.Time `json:"finished_at"`
+	ZeroDone   bool      `json:"zero_done,omitempty"` // остаток обнулён после завершения
+}
+
+func (b *Batch) Matches(a, c int64) bool {
+	return (b.SKU1 == a && b.SKU2 == c) || (b.SKU1 == c && b.SKU2 == a)
+}
+
+// Started — партия уже выставлялась (её заказы считаются целевыми).
+func (b *Batch) Started() bool { return b.State == BatchActive || b.State == BatchDone }
+
+func (p *Profile) ActiveBatch() *Batch {
+	for i := range p.Batches {
+		if p.Batches[i].State == BatchActive {
+			return &p.Batches[i]
+		}
+	}
+	return nil
+}
+
 func (p *Profile) normalize() {
+	// Переход с одной пары на партии.
+	if len(p.Batches) == 0 && p.SKU1 > 0 && p.SKU2 > 0 {
+		p.Batches = []Batch{{ID: newID(), SKU1: p.SKU1, SKU2: p.SKU2, Qty: p.StockQty, State: BatchActive}}
+	}
+	p.SKU1, p.SKU2, p.StockQty = 0, 0, 0
+	for i := range p.Batches {
+		if p.Batches[i].ID == "" {
+			p.Batches[i].ID = newID()
+		}
+		if p.Batches[i].State == "" {
+			p.Batches[i].State = BatchQueued
+		}
+	}
 	if p.PauseSec <= 0 {
 		p.PauseSec = 60
 	}
@@ -60,11 +111,26 @@ func (p *Profile) Validate() error {
 	if p.WarehouseID == 0 {
 		return fmt.Errorf("не выбран склад")
 	}
-	if p.SKU1 <= 0 || p.SKU2 <= 0 {
+	if len(p.Batches) == 0 {
+		return fmt.Errorf("не добавлено ни одной партии (пары SKU)")
+	}
+	for i, b := range p.Batches {
+		if err := b.Validate(); err != nil {
+			return fmt.Errorf("партия %d: %v", i+1, err)
+		}
+	}
+	return nil
+}
+
+func (b *Batch) Validate() error {
+	if b.SKU1 <= 0 || b.SKU2 <= 0 {
 		return fmt.Errorf("не указаны оба SKU")
 	}
-	if p.SKU1 == p.SKU2 {
+	if b.SKU1 == b.SKU2 {
 		return fmt.Errorf("SKU должны быть разными")
+	}
+	if b.Qty < 0 {
+		return fmt.Errorf("количество не может быть отрицательным")
 	}
 	return nil
 }
@@ -123,7 +189,11 @@ func newID() string {
 func newDemoProfile() *Profile {
 	p := &Profile{ID: newID(), Name: "Демо-магазин", Demo: true,
 		WarehouseID: mockWarehouseID, WarehouseName: mockWarehouseName,
-		SKU1: mockSKU1, SKU2: mockSKU2, StockQty: 5, MarginMin: 3}
+		MarginMin: 3, Batches: []Batch{
+			{SKU1: mockSKU1, SKU2: mockSKU2, Qty: 5},
+			{SKU1: mockSKU3, SKU2: mockSKU4, Qty: 3},
+			{SKU1: mockSKU5, SKU2: mockSKU6, Qty: 4},
+		}}
 	p.normalize()
 	return p
 }
@@ -243,7 +313,9 @@ type JEntry struct {
 	Warning       string       `json:"warning,omitempty"`
 	Final         string       `json:"final,omitempty"` // заказ завершён: доставлен, отменён...
 	FinalAt       time.Time    `json:"final_at"`
-	SeenAt        time.Time    `json:"seen_at"` // когда последний раз получали данные из Ozon
+	SeenAt        time.Time    `json:"seen_at"`             // когда последний раз получали данные из Ozon
+	Batch         string       `json:"batch,omitempty"`     // партия, к которой привязан заказ
+	Uncounted     bool         `json:"uncounted,omitempty"` // отменён и вычтен из «продано»
 
 	// Сведения для отображения (последние данные из Ozon).
 	OrderNumber string    `json:"order_number,omitempty"`
@@ -385,6 +457,12 @@ func (l *ShopLog) Add(level, format string, args ...any) {
 		fmt.Fprintf(f, "%s [%s] %s\n", ln.Time.Format("2006-01-02 15:04:05"), level, ln.Text)
 		f.Close()
 	}
+}
+
+func (l *ShopLog) LastSeq() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.seq
 }
 
 func (l *ShopLog) Since(seq int64) []LogLine {

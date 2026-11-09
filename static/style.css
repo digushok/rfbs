@@ -154,3 +154,19 @@ details.skipped[open] summary { margin-bottom: 12px; }
 .toast.err { background: var(--err); }
 .modal { position: fixed; inset: 0; background: rgba(20, 24, 33, .4); display: grid; place-items: center; z-index: 60; }
 .modal-box { background: #fff; border-radius: var(--r-lg); padding: 22px; width: min(520px, 92vw); box-shadow: 0 20px 60px rgba(0, 0, 0, .25); }
+
+/* партии */
+.wh { margin-top: 0; max-width: 760px; }
+.batches td { vertical-align: middle; }
+.batches input { width: 100%; }
+.batches input.qty { width: 90px; text-align: right; }
+.batches tr.active td { background: #f3f8ff; }
+.batches tr.done td { color: var(--muted); }
+.bn { font-weight: 600; font-variant-numeric: tabular-nums; }
+.pname { font-size: 12px; color: var(--muted); max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pname.miss { color: var(--err); }
+.bar { height: 6px; background: var(--field); border-radius: 6px; overflow: hidden; margin-top: 6px; }
+.bar i { display: block; height: 100%; background: var(--accent); border-radius: 6px; }
+.icons { display: flex; gap: 2px; justify-content: flex-end; }
+.icons .btn { padding: 4px 8px; }
+.switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px; }

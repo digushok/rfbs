@@ -71,9 +71,7 @@ function renderProfile(full = true) {
   $('#testReset').classList.toggle('hidden', p.live);
   $$('#modeSeg input').forEach(i => i.checked = (i.value === 'live') === p.live);
   if (!full) return;
-  if (document.activeElement !== $('#sku1')) $('#sku1').value = p.sku1 || '';
-  if (document.activeElement !== $('#sku2')) $('#sku2').value = p.sku2 || '';
-  if (document.activeElement !== $('#stockQty')) $('#stockQty').value = p.stock_qty ?? '';
+  $('#zeroOld').checked = !p.keep_old_stock;
   const ws = $('#whSel');
   if (!ws.options.length || ws.dataset.shop !== p.id) {
     ws.dataset.shop = p.id;
@@ -107,39 +105,97 @@ async function loadWarehouses() {
   } catch (e) { toast(e.message, true); }
 }
 
+// ---------------- партии ----------------
+let prodInfo = {};          // sku → товар из Ozon
+let queueEdit = null;       // редактируемая очередь (пока не сохранена)
+
+function batchSource() {
+  // При работающей автоматизации — её состояние (в тестовом режиме там симуляция), иначе — настройки.
+  if (run && run.running && run.batches) return run.batches;
+  return ((S.profile && S.profile.batches) || []).map((b, i) => ({ ...b, num: i + 1, in_work: 0, delivered: 0 }));
+}
+
+function renderBatches() {
+  const tb = $('#batchTable tbody');
+  if (tb.contains(document.activeElement)) return; // не мешаем вводу
+  const src = batchSource();
+  const started = src.filter(b => b.state !== 'queued');
+  const queued = queueEdit || src.filter(b => b.state === 'queued').map(b => ({ id: b.id, sku1: b.sku1, sku2: b.sku2, qty: b.qty }));
+  const name = sku => {
+    const x = prodInfo[sku];
+    if (!x) return '';
+    return x.missing ? '<div class="pname miss">не найден в магазине</div>' : `<div class="pname" title="${esc(x.name)}">${esc(x.name)}</div>`;
+  };
+  const stock = sku => { const x = prodInfo[sku]; return x && x.present != null ? ` · на складе ${x.present}, резерв ${x.reserved}` : ''; };
+  let n = 0;
+  const rows = started.map(b => {
+    n++;
+    const pct = b.qty > 0 ? Math.min(100, Math.round(b.sold / b.qty * 100)) : 0;
+    const st = b.state === 'active'
+      ? `<span class="chip next">продаётся</span> продано <b>${b.sold}</b> из ${b.qty}<div class="bar"><i style="width:${pct}%"></i></div><div class="muted small">в работе ${b.in_work}, доставлено ${b.delivered}${stock(b.sku1)}</div>`
+      : `<span class="chip ${b.in_work ? 'warn' : 'ok'}">${b.in_work ? 'доставляется' : 'завершена'}</span> продано ${b.sold} из ${b.qty}<div class="muted small">в работе ${b.in_work}, доставлено ${b.delivered}</div>`;
+    const act = b.state === 'done' && !b.in_work ? `<button class="btn ghost sm" data-rm="${b.id}" title="Убрать из списка. Её заказы всё равно будут доведены до конца.">Убрать</button>` : '';
+    return `<tr class="${b.state}" data-keep="${b.id}"><td class="bn">${n}</td><td>${b.sku1}${name(b.sku1)}</td><td>${b.sku2}${name(b.sku2)}</td><td class="r">${b.qty}</td><td>${st}</td><td class="r">${act}</td></tr>`;
+  }).concat(queued.map((b, i) => {
+    n++;
+    return `<tr class="queued" data-qi="${i}"><td class="bn">${n}</td>
+      <td><input data-f="sku1" inputmode="numeric" value="${esc(b.sku1 || '')}" placeholder="SKU Ozon">${name(b.sku1)}</td>
+      <td><input data-f="sku2" inputmode="numeric" value="${esc(b.sku2 || '')}" placeholder="SKU Ozon">${name(b.sku2)}</td>
+      <td class="r"><input data-f="qty" class="qty" type="number" min="1" value="${esc(b.qty || '')}"></td>
+      <td><span class="chip">в очереди</span></td>
+      <td><div class="icons"><button class="btn ghost sm" data-up="${i}" title="Выше">↑</button><button class="btn ghost sm" data-down="${i}" title="Ниже">↓</button><button class="btn ghost sm" data-del="${i}" title="Удалить">✕</button></div></td></tr>`;
+  }));
+  tb.innerHTML = rows.join('') || '<tr><td colspan="6" class="muted">Партий нет — нажмите «+ Партия»</td></tr>';
+  $('#batchSave').classList.toggle('hidden', !queueEdit);
+  $('#batchDirty').classList.toggle('hidden', !queueEdit);
+}
+
+function editQueue() {
+  if (!queueEdit) queueEdit = batchSource().filter(b => b.state === 'queued').map(b => ({ id: b.id, sku1: b.sku1, sku2: b.sku2, qty: b.qty }));
+  return queueEdit;
+}
+
 async function loadProducts() {
-  const p = S.profile, box = $('#prodInfo');
-  if (!p.sku1 && !p.sku2) { box.innerHTML = ''; return; }
-  if (!p.demo && !(p.client_id && p.api_key_set)) { box.innerHTML = ''; return; }
+  const p = S.profile;
+  if (!p || !(p.batches || []).length) { prodInfo = {}; renderBatches(); return; }
+  if (!p.demo && !(p.client_id && p.api_key_set)) { renderBatches(); return; }
   try {
     const j = await api('/api/products?id=' + p.id);
-    box.innerHTML = j.products.map(x => x.missing
-      ? `<div class="prod miss"><div class="t">SKU ${x.sku}</div>Товар не найден в магазине</div>`
-      : `<div class="prod"><div class="t">${esc(x.name)}</div><div class="muted small">SKU ${x.sku} · артикул ${esc(x.offer_id)} · product_id ${x.product_id}</div>
-         <span class="stk">${x.present != null ? `На складе: <b>${x.present}</b> шт. · в резерве: ${x.reserved}` : 'Остаток на выбранном складе: нет данных'}</span></div>`).join('')
-      + (j.stock_error ? `<div class="muted small">Остатки не получены: ${esc(j.stock_error)}</div>` : '');
-  } catch (e) { box.innerHTML = `<div class="prod miss">${esc(e.message)}</div>`; }
+    prodInfo = {};
+    j.products.forEach(x => prodInfo[x.sku] = x);
+  } catch (e) { toast('Товары: ' + e.message, true); }
+  renderBatches();
 }
 
 async function saveCfg() {
   const ws = $('#whSel'), opt = ws.selectedOptions[0];
-  const body = { id: S.profile.id, sku1: $('#sku1').value.trim(), sku2: $('#sku2').value.trim() };
-  if (ws.value) { body.warehouse_id = ws.value; body.warehouse_name = opt ? opt.textContent.split(' · ')[0] : ''; }
+  if (!ws.value) return toast('Выберите склад', true);
   try {
-    await api('/api/profile/save', body);
+    await api('/api/profile/save', { id: S.profile.id, warehouse_id: ws.value, warehouse_name: opt ? opt.textContent.split(' · ')[0] : '' });
     $('#cfgMsg').textContent = 'Сохранено'; setTimeout(() => $('#cfgMsg').textContent = '', 2500);
     await loadState(); loadProducts();
   } catch (e) { toast(e.message, true); }
 }
 
-async function applyStock() {
-  const p = S.profile, qty = $('#stockQty').value.trim();
-  if (qty === '') return toast('Укажите количество', true);
-  if (p.live && !(await confirmBox(`<h3>Выставить остатки?</h3><p>Обоим SKU (${p.sku1} и ${p.sku2}) на складе «${esc(p.warehouse_name)}» будет выставлено <b>${qty} шт.</b> Это изменит остатки в Ozon.</p>`, 'Выставить'))) return;
+async function saveBatches() {
+  const keep = $$('#batchTable tr[data-keep]').map(tr => tr.dataset.keep);
   try {
-    const j = await api('/api/stock', { id: p.id, qty });
+    await api('/api/batches/save', { id: S.profile.id, keep_ids: keep, batches: queueEdit || [] });
+    queueEdit = null;
+    document.activeElement.blur();
+    toast('Очередь партий сохранена');
+    await loadState(); await refreshRun(); loadProducts();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function applyStock() {
+  const p = S.profile, a = batchSource().find(b => b.state === 'active');
+  if (!a) return toast('Нет активной партии — запустите автоматизацию, она выставит остаток первой партии сама', true);
+  if (p.live && !(await confirmBox(`<h3>Выставить остаток заново?</h3><p>SKU ${a.sku1} и ${a.sku2} на складе «${esc(p.warehouse_name)}» будет выставлено по <b>${a.qty} шт.</b> Это изменит остатки в Ozon.</p>`, 'Выставить'))) return;
+  try {
+    const j = await api('/api/stock', { id: p.id, qty: a.qty });
     $('#stockMsg').innerHTML = j.messages.map(m => `<div class="${m.startsWith('[ТЕСТ]') ? 'test' : 'ok'}">${esc(m)}</div>`).join('');
-    loadState(); setTimeout(loadProducts, 800);
+    setTimeout(loadProducts, 800);
   } catch (e) { $('#stockMsg').innerHTML = `<div class="err">${esc(e.message)}</div>`; }
 }
 
@@ -176,8 +232,13 @@ function stepCell(v, i) {
   return `<span class="st plan">~ ${fmt(t)}</span>`;
 }
 
+let lastActive = '';
 function renderRun() {
   const p = S.profile;
+  const actB = ((run && run.batches) || []).find(b => b.state === 'active');
+  const key = actB ? actB.id + ':' + actB.sold : '';
+  if (key !== lastActive) { lastActive = key; if (run && run.running) loadProducts(); }
+  renderBatches();
   const btn = $('#runBtn'), on = run && run.running;
   btn.textContent = on ? 'Остановить' : 'Запустить';
   btn.className = 'btn lg ' + (on ? 'stop' : 'primary');
@@ -200,7 +261,7 @@ function renderRun() {
     const notes = (v.error ? `<div class="note err">${esc(v.error)}</div>` : '') + (v.warning ? `<div class="note warn">${esc(v.warning)}</div>` : '');
     const win = v.window_end && !v.window_end.startsWith('0001') ? `${fmt(v.window_begin, true)} – ${fmt(v.window_end, true).slice(-5)}` : '<span class="note warn">нет данных</span>';
     return `<tr class="${v.final ? 'fin' : ''}">
-      <td><div class="pn">${esc(v.posting_number)}</div><div class="muted small">создан ${fmt(v.created, true)} · Ozon: ${esc(v.status)}</div></td>
+      <td><div class="pn">${esc(v.posting_number)}</div><div class="muted small">${v.batch ? `партия ${v.batch} · ` : ''}создан ${fmt(v.created, true)} · Ozon: ${esc(v.status)}</div></td>
       <td class="st">${win}</td>
       ${[1, 2, 3, 4].map(i => `<td>${stepCell(v, i)}</td>`).join('')}
       <td>${now}${notes}</td></tr>`;
@@ -244,7 +305,7 @@ $$('.tabs button').forEach(b => b.onclick = () => {
   $$('.tab').forEach(t => t.classList.toggle('hidden', t.id !== 'tab-' + b.dataset.tab));
   if (b.dataset.tab === 'log') { renderLog(); const box = $('#logList'); box.scrollTop = box.scrollHeight; }
 });
-$('#shopSel').onchange = async e => { await api('/api/profile/select', { id: e.target.value }); run = null; await loadState(); refreshRun(); refreshLog(); loadProducts(); };
+$('#shopSel').onchange = async e => { await api('/api/profile/select', { id: e.target.value }); run = null; queueEdit = null; await loadState(); refreshRun(); refreshLog(); loadProducts(); };
 $('#quitBtn').onclick = async () => {
   const anyRun = S.shops.some(s => s.running);
   if (!(await confirmBox(`<h3>Закрыть программу?</h3>${anyRun ? '<p>Автоматизация будет приостановлена до следующего запуска программы. Пока программа закрыта, статусы заказов не меняются.</p>' : ''}`, 'Закрыть'))) return;
@@ -254,7 +315,47 @@ $('#quitBtn').onclick = async () => {
 $('#whReload').onclick = e => { e.preventDefault(); loadWarehouses(); };
 $('#cfgSave').onclick = saveCfg;
 $('#stockApply').onclick = applyStock;
-$('#stockReload').onclick = loadProducts;
+$('#batchSave').onclick = saveBatches;
+$('#batchAdd').onclick = () => {
+  editQueue().push({ sku1: '', sku2: '', qty: '' });
+  if (document.activeElement) document.activeElement.blur();
+  renderBatches();
+  const rows = $$('#batchTable tr.queued');
+  if (rows.length) $('input', rows[rows.length - 1]).focus();
+};
+$('#batchTable').addEventListener('input', e => {
+  const tr = e.target.closest('tr.queued'); if (!tr) return;
+  editQueue()[+tr.dataset.qi][e.target.dataset.f] = e.target.value.trim();
+  $('#batchSave').classList.remove('hidden'); $('#batchDirty').classList.remove('hidden');
+});
+$('#batchTable').addEventListener('click', async e => {
+  const d = e.target.dataset;
+  if (d.up !== undefined || d.down !== undefined || d.del !== undefined) {
+    const q = editQueue(), i = +(d.up ?? d.down ?? d.del);
+    if (d.del !== undefined) q.splice(i, 1);
+    else { const j = d.up !== undefined ? i - 1 : i + 1; if (j >= 0 && j < q.length) [q[i], q[j]] = [q[j], q[i]]; }
+    if (document.activeElement) document.activeElement.blur();
+    renderBatches();
+  }
+  if (d.rm) {
+    if (!(await confirmBox('<h3>Убрать партию из списка?</h3><p>Её заказы, которые уже в работе, всё равно будут доведены до «Условно доставлен».</p>', 'Убрать'))) return;
+    try { await api('/api/batches/remove', { id: S.profile.id, batch_id: d.rm }); await loadState(); await refreshRun(); } catch (er) { toast(er.message, true); }
+  }
+});
+$('#batchNext').onclick = async () => {
+  const src = batchSource(), a = src.find(b => b.state === 'active'), q = src.find(b => b.state === 'queued');
+  const msg = a ? `Партия ${a.num} (SKU ${a.sku1} + ${a.sku2}) будет завершена${S.profile.keep_old_stock ? '' : ', её остаток обнулён'}. ` : '';
+  const nx = q ? `Запустится партия ${q.num} (SKU ${q.sku1} + ${q.sku2}): остаток по ${q.qty} шт.` : 'В очереди нет партий — новая не запустится.';
+  if (!(await confirmBox(`<h3>Перейти к следующей партии?</h3><p>${msg}${nx}</p><p class="muted">Заказы завершённой партии будут доведены до конца.</p>`, 'Перейти'))) return;
+  try { await api('/api/batches/next', { id: S.profile.id }); toast('Переключаю…'); setTimeout(refreshRun, 1500); } catch (er) { toast(er.message, true); }
+};
+$('#zeroOld').onchange = async e => {
+  try {
+    await api('/api/profile/save', { id: S.profile.id, keep_old_stock: !e.target.checked });
+    await loadState(false);
+    toast(e.target.checked ? 'Остаток старой пары будет обнуляться' : 'Остаток старой пары останется как есть');
+  } catch (er) { toast(er.message, true); }
+};
 $$('#modeSeg input').forEach(i => i.onchange = () => setMode(i.value === 'live'));
 $('#runBtn').onclick = toggleRun;
 $('#pollNow').onclick = async () => { await api('/api/run/now', { id: S.profile.id }); setTimeout(refreshRun, 1500); };

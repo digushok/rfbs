@@ -151,14 +151,8 @@ func (s *Server) Routes(mux *http.ServeMux) {
 				p.WarehouseID = v
 				p.WarehouseName = str(b, "warehouse_name")
 			}
-			if v, ok := num(b, "sku1"); ok {
-				p.SKU1 = v
-			}
-			if v, ok := num(b, "sku2"); ok {
-				p.SKU2 = v
-			}
-			if v, ok := num(b, "stock_qty"); ok {
-				p.StockQty = int(v)
+			if v, ok := b["keep_old_stock"].(bool); ok {
+				p.KeepOldStock = v
 			}
 			if v, ok := num(b, "pause_sec"); ok {
 				p.PauseSec = int(v)
@@ -267,9 +261,13 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			return nil, fmt.Errorf("магазин не найден")
 		}
 		var skus []int64
-		for _, v := range []int64{p.SKU1, p.SKU2} {
-			if v > 0 {
-				skus = append(skus, v)
+		seen := map[int64]bool{}
+		for _, bt := range p.Batches {
+			for _, v := range []int64{bt.SKU1, bt.SKU2} {
+				if v > 0 && !seen[v] {
+					seen[v] = true
+					skus = append(skus, v)
+				}
 			}
 		}
 		if len(skus) == 0 {
@@ -305,6 +303,89 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			}
 		}
 		return map[string]any{"products": out, "stock_error": stockErr}, nil
+	})
+
+	s.handle(mux, "/api/batches/save", func(r *http.Request, b map[string]any) (any, error) {
+		id := s.id(r, b)
+		list, _ := b["batches"].([]any)
+		var queued []Batch
+		for i, x := range list {
+			m, _ := x.(map[string]any)
+			if m == nil {
+				continue
+			}
+			bt := Batch{ID: str(m, "id"), State: BatchQueued}
+			bt.SKU1, _ = num(m, "sku1")
+			bt.SKU2, _ = num(m, "sku2")
+			q, _ := num(m, "qty")
+			bt.Qty = int(q)
+			if err := bt.Validate(); err != nil {
+				return nil, fmt.Errorf("строка %d: %v", i+1, err)
+			}
+			if bt.Qty <= 0 {
+				return nil, fmt.Errorf("строка %d: укажите количество больше 0", i+1)
+			}
+			queued = append(queued, bt)
+		}
+		_, err := s.store.Update(id, func(p *Profile) {
+			// Начатые партии не трогаем. keep_ids — партии, которые окно показывает как начатые
+			// (в тестовом режиме они начаты только в симуляции, а в настройках ещё в очереди).
+			keep := map[string]bool{}
+			if ids, ok := b["keep_ids"].([]any); ok {
+				for _, x := range ids {
+					if v, ok := x.(string); ok {
+						keep[v] = true
+					}
+				}
+			}
+			var out []Batch
+			started := map[string]bool{}
+			for _, bt := range p.Batches {
+				if bt.Started() || keep[bt.ID] {
+					out = append(out, bt)
+					started[bt.ID] = true
+				}
+			}
+			for _, q := range queued { // партию могли запустить, пока вы редактировали очередь
+				if !started[q.ID] {
+					out = append(out, q)
+				}
+			}
+			p.Batches = out
+		})
+		if err != nil {
+			return nil, err
+		}
+		s.mgr.Log(id).Add("info", "Очередь партий сохранена: в очереди %d.", len(queued))
+		s.mgr.Kick(id)
+		return map[string]any{"ok": true}, nil
+	})
+
+	s.handle(mux, "/api/batches/remove", func(r *http.Request, b map[string]any) (any, error) {
+		id, bid := s.id(r, b), str(b, "batch_id")
+		var err error
+		_, uerr := s.store.Update(id, func(p *Profile) {
+			var out []Batch
+			for _, bt := range p.Batches {
+				if bt.ID == bid {
+					if bt.State == BatchActive {
+						err = fmt.Errorf("активную партию удалить нельзя — сначала переключитесь на следующую")
+					} else {
+						continue
+					}
+				}
+				out = append(out, bt)
+			}
+			p.Batches = out
+		})
+		if uerr != nil {
+			return nil, uerr
+		}
+		return map[string]any{"ok": true}, err
+	})
+
+	s.handle(mux, "/api/batches/next", func(r *http.Request, b map[string]any) (any, error) {
+		return map[string]any{"ok": true}, s.mgr.SwitchNext(s.id(r, b))
 	})
 
 	s.handle(mux, "/api/stock", func(r *http.Request, b map[string]any) (any, error) {
