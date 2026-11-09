@@ -97,3 +97,51 @@ func TestLoad100PerHour(t *testing.T) {
 func TestLoadUnknownLastMileStatus(t *testing.T) {
 	runLoad(t, [2]string{"some_new_status", "posting_some_new"})
 }
+
+// Несколько заказов, которые нужно перевести в «Условно доставлен» в пределах одной минуты:
+// концы окон отличаются на 6 секунд. Каждый должен уйти в свой момент, а не раньше и не позже.
+func TestManyDeliveriesWithinOneMinute(t *testing.T) {
+	start := time.Date(2026, 11, 9, 10, 0, 0, 0, time.UTC)
+	ck := &clock{t: start}
+	m := NewMockOzon(ck.now)
+	m.OrderEvery = 0
+	prof := Profile{ID: "min", Demo: true, WarehouseID: mockWarehouseID, SKU1: mockSKU1, SKU2: mockSKU2, Live: true}
+	prof.normalize()
+	prof.MarginMin = 3
+	c := &Client{base: "http://demo", http: &http.Client{Transport: m}}
+	dir := t.TempDir()
+	w := NewWorker(prof, c, LoadJournal(filepath.Join(dir, "j.json")), NewShopLog(dir, "min"))
+	w.clock = ck.now
+	base := start.Add(30 * time.Minute)
+	var ps []*Posting
+	for i := 0; i < 10; i++ {
+		p := m.AddPosting("target")
+		p.AnalyticsData.DeliveryDateBegin.Time = base.Add(-2 * time.Hour)
+		p.AnalyticsData.DeliveryDateEnd.Time = base.Add(time.Duration(i*6) * time.Second)
+		ps = append(ps, p)
+	}
+	ctx := context.Background()
+	for ck.t.Before(base.Add(5 * time.Minute)) {
+		next := w.Tick(ctx)
+		wait := time.Duration(prof.PollSec) * time.Second
+		if !next.IsZero() {
+			if d := next.Sub(ck.t) + time.Second; d < wait {
+				wait = d
+			}
+		}
+		if wait < 2*time.Second {
+			wait = 2 * time.Second
+		}
+		ck.add(wait + 1500*time.Millisecond) // запас на время ответа Ozon
+	}
+	for i, p := range ps {
+		e := w.journal.Peek(p.PostingNumber)
+		want := p.AnalyticsData.DeliveryDateEnd.Time.Add(-3 * time.Minute)
+		got := e.DoneAt[StageDelivered]
+		if p.Status != "delivered" || got.Before(want) || got.Sub(want) > 10*time.Second {
+			t.Fatalf("заказ %d: план %v, переведён %v (%s)", i, want.Format("15:04:05"), got.Format("15:04:05"), p.Status)
+		}
+		t.Logf("заказ %d: конец окна %s, план %s, переведён %s (+%s)", i, p.AnalyticsData.DeliveryDateEnd.Time.Format("15:04:05"),
+			want.Format("15:04:05"), got.Format("15:04:05"), got.Sub(want).Round(100*time.Millisecond))
+	}
+}
