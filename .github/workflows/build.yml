@@ -28,13 +28,13 @@ jobs:
       - name: Версия
         run: echo "VERSION=$(tr -d ' \r\n' < VERSION)" >> "$GITHUB_ENV"
 
-      - name: Сборка OzonRFBS.exe
-        run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-H windowsgui -s -w -X main.appVersion=${VERSION}" -o OzonRFBS.exe .
+      - name: Сборка OzonRFBS-<версия>.exe
+        run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-H windowsgui -s -w -X main.appVersion=${VERSION}" -o "OzonRFBS-${VERSION}.exe" .
 
       - uses: actions/upload-artifact@v4
         with:
           name: OzonRFBS-${{ env.VERSION }}-windows
-          path: OzonRFBS.exe
+          path: OzonRFBS-${{ env.VERSION }}.exe
 
       - name: Релиз на GitHub
         if: github.ref_name == github.event.repository.default_branch
@@ -49,6 +49,6 @@ jobs:
           awk -v v="$VERSION" '/^## /{p = index($0, v) > 0; next} p' CHANGELOG.md > notes.md
           {
             echo
-            echo "**Как обновиться:** закройте программу (⏻), замените OzonRFBS.exe на новый и запустите. Настройки и ключи сохраняются."
+            echo "**Как обновиться:** закройте программу (⏻), удалите старый .exe, скачайте OzonRFBS-${VERSION}.exe и запустите его. Настройки и ключи сохраняются."
           } >> notes.md
-          gh release create "$TAG" OzonRFBS.exe --target "$GITHUB_SHA" --title "Ozon rFBS $TAG" --notes-file notes.md --latest
+          gh release create "$TAG" "OzonRFBS-${VERSION}.exe" --target "$GITHUB_SHA" --title "Ozon rFBS $TAG" --notes-file notes.md --latest

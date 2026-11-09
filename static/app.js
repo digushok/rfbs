@@ -303,7 +303,7 @@ $('#updCheck').onclick = async () => {
   try {
     const j = await api('/api/update');
     box.innerHTML = j.newer
-      ? `<div class="ok">Доступна версия <b>${esc(j.latest)}</b> (у вас ${esc(j.current)}). ${j.download ? `<a href="${esc(j.download)}">Скачать .exe</a> · ` : ''}<a href="${esc(j.url)}" target="_blank" rel="noopener">что нового</a><br><span class="small">Закройте программу (⏻), замените файл .exe на новый и запустите. Настройки сохранятся.</span></div>`
+      ? `<div class="ok">Доступна версия <b>${esc(j.latest)}</b> (у вас ${esc(j.current)}). ${j.download ? `<a href="${esc(j.download)}">Скачать ${esc(j.download.split('/').pop())}</a> · ` : ''}<a href="${esc(j.url)}" target="_blank" rel="noopener">что нового</a><br><span class="small">Закройте программу (⏻), удалите старый .exe и запустите новый. Настройки сохранятся.</span></div>`
       : `<div>У вас последняя версия (${esc(j.current)}).</div>`;
   } catch (e) { box.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
 };
