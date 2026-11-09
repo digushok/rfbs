@@ -79,8 +79,8 @@
     </div>
 
     <div class="card">
-      <div class="card-h"><span class="step">4</span><div><h2>Целевые заказы</h2><p class="sub" id="ordersSub">Время — по часам этого компьютера. «~» — запланировано, «✓» — выполнено</p></div></div>
-      <div class="scroll"><table class="grid" id="ordersTable">
+      <div class="card-h"><span class="step">4</span><div><h2>Целевые заказы <span class="muted" id="ordersCount"></span></h2><p class="sub" id="ordersSub">Время — по часам этого компьютера. «~» — запланировано, «✓» — выполнено</p></div></div>
+      <div class="scroll tablebox"><table class="grid" id="ordersTable">
         <thead><tr><th>Отправление</th><th>Окно доставки</th><th>Собрать</th><th>Доставляется</th><th>Курьер в пути</th><th>Условно доставлен</th><th>Сейчас</th></tr></thead>
         <tbody></tbody>
       </table></div>
@@ -89,7 +89,7 @@
 
     <details class="card skipped">
       <summary><b>Пропущенные заказы</b> <span class="muted" id="skipCount"></span><span class="muted small"> — не подходят по составу или складу, программа их не трогает</span></summary>
-      <div class="scroll"><table class="grid" id="skipTable">
+      <div class="scroll tablebox"><table class="grid" id="skipTable">
         <thead><tr><th>Отправление</th><th>Создан</th><th>Состав (SKU×шт)</th><th>Статус</th><th>Причина</th></tr></thead>
         <tbody></tbody>
       </table></div>

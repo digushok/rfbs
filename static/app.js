@@ -188,6 +188,9 @@ function renderRun() {
 
   const rows = (run && run.postings) || [];
   $('#ordersEmpty').classList.toggle('hidden', rows.length > 0);
+  const act = rows.filter(v => !v.final).length;
+  $('#ordersCount').textContent = rows.length ? `· в работе ${act}, завершено ${rows.length - act}` : '';
+  $('#ordersTable').closest('.tablebox').classList.toggle('hidden', rows.length === 0);
   $('#ordersEmpty').textContent = on ? 'Пока нет целевых заказов.' : 'Запустите автоматизацию, чтобы увидеть заказы.';
   $('#ordersTable tbody').innerHTML = rows.map(v => {
     let now;

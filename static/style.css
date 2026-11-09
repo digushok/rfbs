@@ -106,6 +106,12 @@ input:focus, select:focus { outline: none; border-color: var(--accent); backgrou
 
 /* таблицы */
 .scroll { overflow-x: auto; }
+/* Таблицы заказов: фиксированная высота с прокруткой, шапка остаётся на месте */
+.tablebox { max-height: min(560px, 65vh); overflow: auto; border: 1px solid var(--line); border-radius: var(--r-md); }
+.tablebox thead th { position: sticky; top: 0; z-index: 1; background: var(--card); box-shadow: inset 0 -1px 0 var(--line); }
+.tablebox::-webkit-scrollbar { width: 10px; height: 10px; }
+.tablebox::-webkit-scrollbar-thumb { background: #cfd5e1; border-radius: 10px; border: 2px solid var(--card); }
+.tablebox::-webkit-scrollbar-track { background: transparent; }
 table.grid { width: 100%; border-collapse: collapse; }
 .grid th { text-align: left; font-size: 11.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); padding: 8px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
 .grid td { padding: 10px; border-bottom: 1px solid var(--line); vertical-align: top; font-size: 13px; }
