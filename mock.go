@@ -45,6 +45,7 @@ type MockOzon struct {
 	Calls         map[string]int  // сколько раз вызван каждый метод
 	Fail          map[string]bool // принудительная ошибка метода (для тестов)
 	BadPostings   map[string]bool // отправления, из-за которых Ozon отклоняет весь запрос (для тестов)
+	NoTransition  map[string]bool // отправления, которые Ozon не даёт перевести («invalid transition»)
 	LastMileState [2]string       // статус/подстатус после «курьер в пути»
 	// Окно доставки демо-заказа относительно момента заказа.
 	WindowStart, WindowEnd time.Duration
@@ -309,6 +310,8 @@ func (m *MockOzon) Handle(path string, body []byte) (int, any) {
 			switch {
 			case p == nil:
 				errText = "POSTING_NOT_FOUND"
+			case m.NoTransition[pn]:
+				errText = "invalid transition 3095 -> 380 by seller-delivered"
 			case path == "/v2/fbs/posting/delivering" && p.Status == "awaiting_deliver":
 				p.Status, p.Substatus, ok = "delivering", "posting_transferring_to_delivery", true
 			case path == "/v2/fbs/posting/last-mile" && p.Status == "delivering" && p.Substatus != m.LastMileState[1]:

@@ -92,3 +92,42 @@ func TestBatchRejectedFallbackSingle(t *testing.T) {
 		t.Fatalf("повтор не сработал: %s", ps[2].Status)
 	}
 }
+
+// Заказ уже доставлен вручную: Ozon оставляет статус delivering, но подстатус — условно доставлен.
+func TestConditionallyDeliveredSubstatus(t *testing.T) {
+	w, m, ck := setup(t, true)
+	p := m.AddPosting("target")
+	p.Status, p.Substatus = "delivering", "posting_conditionally_delivered"
+	ck.t = p.AnalyticsData.DeliveryDateEnd.Time.Add(time.Minute) // уже просрочен
+	w.Tick(context.Background())
+	e := w.journal.Peek(p.PostingNumber)
+	if e.Final == "" || m.Calls["/v2/fbs/posting/delivered"] != 0 {
+		t.Fatalf("доставленный вручную заказ трогать нельзя: final=%q, запросов %d", e.Final, m.Calls["/v2/fbs/posting/delivered"])
+	}
+}
+
+// Ozon дважды отвечает «invalid transition» — программа прекращает попытки и просит проверить вручную.
+func TestInvalidTransitionStops(t *testing.T) {
+	w, m, ck := setup(t, true)
+	p := m.AddPosting("target")
+	p.Status, p.Substatus = "driver_pickup", "posting_driver_pick_up"
+	ok := m.AddPosting("target")
+	ok.Status, ok.Substatus = "driver_pickup", "posting_driver_pick_up"
+	w.Tick(context.Background())
+	m.NoTransition = map[string]bool{p.PostingNumber: true}
+	ck.t = p.AnalyticsData.DeliveryDateEnd.Time.Add(-3 * time.Minute)
+	for i := 0; i < 10; i++ {
+		w.Tick(context.Background())
+		ck.add(16 * time.Second)
+	}
+	e := w.journal.Peek(p.PostingNumber)
+	if e.Final != "проверьте вручную" || e.Warning == "" {
+		t.Fatalf("ожидали «проверьте вручную»: final=%q", e.Final)
+	}
+	if n := m.Calls["/v2/fbs/posting/delivered"]; n > 3 {
+		t.Fatalf("слишком много попыток: %d", n)
+	}
+	if ok.Status != "delivered" {
+		t.Fatalf("соседний заказ должен быть переведён: %s", ok.Status)
+	}
+}

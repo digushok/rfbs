@@ -371,6 +371,8 @@ type JEntry struct {
 	OrderNumber string    `json:"order_number,omitempty"`
 	Products    string    `json:"products,omitempty"`
 	Status      string    `json:"status,omitempty"`
+	Substatus   string    `json:"substatus,omitempty"`
+	Invalid     int       `json:"invalid,omitempty"` // сколько раз подряд Ozon ответил «invalid transition» на «Условно доставлен»
 	Created     time.Time `json:"created"`
 	WindowBegin time.Time `json:"window_begin"`
 	WindowEnd   time.Time `json:"window_end"`

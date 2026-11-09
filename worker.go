@@ -28,6 +28,13 @@ var lastMileSubstatuses = map[string]bool{
 // realStage — этап по статусу в Ozon. ok=false — статус не наш (не трогаем),
 // final — заказ завершён (доставлен, отменён, арбитраж).
 func realStage(p *Posting) (stage int, ok bool, final string) {
+	// rFBS: после «Условно доставлен» Ozon может оставлять статус delivering — смотрим подстатус.
+	switch p.Substatus {
+	case "posting_conditionally_delivered":
+		return StageDelivered, true, "условно доставлен"
+	case "posting_delivered", "posting_received", "posting_delivered_to_customer":
+		return StageDelivered, true, "доставлен"
+	}
 	switch p.Status {
 	case "awaiting_packaging":
 		return StageNew, true, ""
@@ -104,6 +111,7 @@ type PostingView struct {
 	OrderNumber   string       `json:"order_number"`
 	Created       time.Time    `json:"created"`
 	Status        string       `json:"status"`
+	Substatus     string       `json:"substatus,omitempty"`
 	Stage         int          `json:"stage"`
 	Final         string       `json:"final,omitempty"`
 	WindowBegin   time.Time    `json:"window_begin"`
@@ -435,12 +443,16 @@ func (w *Worker) Tick(ctx context.Context) time.Time {
 func (w *Worker) update(p *Posting, now time.Time, batchID string, noCount bool) (pendingAction, bool) {
 	begin, end := p.Window()
 	e := w.journal.Get(p.PostingNumber)
-	e.SeenAt, e.OrderNumber, e.Products, e.Status = now, p.OrderNumber, productsText(p), p.Status
+	isNew := e.SeenAt.IsZero()
+	e.SeenAt, e.OrderNumber, e.Products, e.Status, e.Substatus = now, p.OrderNumber, productsText(p), p.Status, p.Substatus
 	e.Created, e.WindowBegin, e.WindowEnd = p.InProcessAt.Time, begin, end
 	if strings.HasPrefix(e.LastError, "не удалось получить заказ") {
 		e.LastError = ""
 	}
 	w.journal.MarkDirty()
+	if e.Final != "" {
+		return pendingAction{}, false // программа с этим заказом закончила
+	}
 
 	rs, ok, final := realStage(p)
 	if ok && rs > e.Stage {
@@ -485,8 +497,10 @@ func (w *Worker) update(p *Posting, now time.Time, batchID string, noCount bool)
 		}
 		return pendingAction{}, false
 	}
-	w.logOnce("found|"+p.PostingNumber, "info", "Найден целевой заказ %s (%s), статус Ozon: %s, окно доставки: %s.",
-		p.PostingNumber, productsText(p), p.Status, fmtWindow(begin, end))
+	if isNew {
+		w.logOnce("found|"+p.PostingNumber, "info", "Найден целевой заказ %s (%s), статус Ozon: %s, окно доставки: %s.",
+			p.PostingNumber, productsText(p), p.Status, fmtWindow(begin, end))
+	}
 
 	next := e.Stage + 1
 	due, warn := w.dueFor(next, e, now)
@@ -672,8 +686,20 @@ func (w *Worker) execute(ctx context.Context, pend []pendingAction, now time.Tim
 					strings.Join(pns, ", "), err, chunk[0].e.NextTry.Sub(now).Round(time.Second))
 				continue
 			}
+			failed := map[string][]string{} // текст ошибки → заказы
 			for _, a := range chunk {
-				w.result(a, res[a.p.PostingNumber], now)
+				if err := res[a.p.PostingNumber]; err != nil {
+					w.fail(a, err, now, true)
+					if a.e.Final == "" { // не «проверьте вручную»
+						failed[err.Error()] = append(failed[err.Error()], a.p.PostingNumber)
+					}
+					continue
+				}
+				w.result(a, nil, now)
+			}
+			for msg, pns := range failed {
+				w.log.Add("err", "Не удалось «%s» для %d заказов (%s): %s. Повтор через %s.", actionNames[next], len(pns),
+					strings.Join(pns, ", "), msg, w.journal.Peek(pns[0]).NextTry.Sub(now).Round(time.Second))
 			}
 		}
 	}
@@ -718,6 +744,20 @@ func (w *Worker) fail(a pendingAction, err error, now time.Time, quiet bool) {
 	delay := retryDelay(e.Fails)
 	if a.next == StageDelivered {
 		delay = deadlineRetry // у «Условно доставлен» есть срок — повторяем быстро
+		if strings.Contains(strings.ToLower(err.Error()), "invalid transition") {
+			// Ozon не даёт перевести: заказ уже в другом состоянии (чаще всего — уже доставлен вручную).
+			e.Invalid++
+			if e.Invalid >= 2 {
+				e.Final, e.FinalAt, e.DueAt, e.NextTry = "проверьте вручную", now, time.Time{}, time.Time{}
+				e.Warning = "Ozon не даёт перевести в «Условно доставлен» (" + err.Error() + "). Скорее всего, заказ уже доставлен вручную — проверьте в кабинете."
+				w.journal.MarkDirty()
+				w.log.Add("warn", "Заказ %s: Ozon дважды ответил, что перевод в «Условно доставлен» невозможен (%v). Больше не пытаюсь — проверьте заказ в кабинете (скорее всего, он уже доставлен вручную). Подстатус Ozon: %s.",
+					a.p.PostingNumber, err, e.Substatus)
+				return
+			}
+		} else {
+			e.Invalid = 0
+		}
 	}
 	e.NextTry = now.Add(delay)
 	w.journal.MarkDirty()
@@ -745,7 +785,7 @@ func (w *Worker) buildViews(now time.Time) ([]PostingView, time.Time) {
 		} else if e.Stage < 0 && e.Warning == "" || now.Sub(e.SeenAt) > 3*24*time.Hour {
 			continue
 		}
-		v := PostingView{PostingNumber: e.PostingNumber, OrderNumber: e.OrderNumber, Created: e.Created, Status: e.Status,
+		v := PostingView{PostingNumber: e.PostingNumber, OrderNumber: e.OrderNumber, Created: e.Created, Status: e.Status, Substatus: e.Substatus,
 			Stage: e.Stage, Final: e.Final, WindowBegin: e.WindowBegin, WindowEnd: e.WindowEnd, Warning: e.Warning, Error: e.LastError,
 			Batch: w.num(e.Batch), Manual: e.Manual, Picked: e.Picked, NoCount: e.NoCount}
 		for i := 0; i <= StageDelivered; i++ {
