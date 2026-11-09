@@ -170,4 +170,7 @@ details.skipped[open] summary { margin-bottom: 12px; }
 .bar i { display: block; height: 100%; background: var(--accent); border-radius: 6px; }
 .icons { display: flex; gap: 2px; justify-content: flex-end; }
 .icons .btn { padding: 4px 8px; }
+.subh { font-size: 13px; font-weight: 600; margin: 20px 0 10px; color: var(--ink2); }
+.self-end { align-self: end; }
+.batches tr.next td { background: #f6faf3; }
 .switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px; }

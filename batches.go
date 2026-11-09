@@ -26,6 +26,7 @@ func (w *Worker) loadBatches() {
 		if p, ok := w.store.Get(w.prof.ID); ok {
 			base = p.Batches
 			w.prof.KeepOldStock = p.KeepOldStock
+			w.prof.PrestockLeft = p.PrestockLeft
 		}
 	} else {
 		base = w.prof.Batches
@@ -120,11 +121,17 @@ func (w *Worker) manageBatches(ctx context.Context, now time.Time) {
 	w.switchReq = false
 	w.mu.Unlock()
 
-	var active *Batch
+	var active, early *Batch
 	for i := range w.bt {
-		if w.bt[i].State == BatchActive {
-			active = &w.bt[i]
-			break
+		switch w.bt[i].State {
+		case BatchActive:
+			if active == nil {
+				active = &w.bt[i]
+			}
+		case BatchNext:
+			if early == nil {
+				early = &w.bt[i]
+			}
 		}
 	}
 	// 1. Завершаем активную партию: распродана или переключение вручную.
@@ -161,8 +168,22 @@ func (w *Worker) manageBatches(ctx context.Context, now time.Time) {
 		w.btDirty[b.ID] = true
 	}
 
-	// 3. Нет активной — запускаем следующую из очереди.
-	if active != nil {
+	// 3. Нет основной партии: следующая, выставленная заранее, становится основной.
+	if active == nil && early != nil {
+		early.State = BatchActive
+		w.btDirty[early.ID] = true
+		w.log.Add("ok", "%s стала основной (продано %d из %d).", batchName(w.num(early.ID), early), early.Sold, early.Qty)
+		active, early = early, nil
+	}
+	// 4. Выставляем следующую из очереди: сразу, если основной нет, или заранее —
+	// когда до конца основной осталось не больше порога. Заранее — не больше одной партии.
+	prestock := w.prof.Prestock()
+	ahead := false
+	switch {
+	case active == nil:
+	case early == nil && prestock > 0 && active.Qty-active.Sold <= prestock:
+		ahead = true
+	default:
 		return
 	}
 	var next *Batch
@@ -192,9 +213,43 @@ func (w *Worker) manageBatches(ctx context.Context, now time.Time) {
 		w.log.Add("err", "%s: не удалось выставить остаток %d шт.: %v (повторю через минуту).", batchName(n, next), next.Qty, err)
 		return
 	}
-	next.State, next.StartedAt, next.FinishedAt = BatchActive, now, time.Time{}
+	next.StartedAt, next.FinishedAt = now, time.Time{}
 	w.btDirty[next.ID] = true
+	if ahead {
+		next.State = BatchNext
+		w.log.Add("ok", "%s выставлена заранее: по %d шт. (в партии %d осталось %d из %d).", batchName(n, next), next.Qty,
+			w.num(active.ID), active.Qty-active.Sold, active.Qty)
+		return
+	}
+	next.State = BatchActive
 	w.log.Add("ok", "%s запущена: выставлено по %d шт.", batchName(n, next), next.Qty)
+	// Маленькая партия: порог достигнут сразу — выставляем и следующую.
+	if prestock > 0 && next.Qty-next.Sold <= prestock {
+		w.manageAhead(ctx, now, next)
+	}
+}
+
+// manageAhead выставляет заранее одну партию из очереди после основной.
+func (w *Worker) manageAhead(ctx context.Context, now time.Time, active *Batch) {
+	var next *Batch
+	for i := range w.bt {
+		if w.bt[i].State == BatchQueued {
+			next = &w.bt[i]
+			break
+		}
+	}
+	if next == nil || next.Validate() != nil {
+		return
+	}
+	n := w.num(next.ID)
+	if err := w.setPairStock(ctx, next, next.Qty); err != nil {
+		w.activateAt = now.Add(time.Minute)
+		w.log.Add("err", "%s: не удалось выставить остаток %d шт.: %v (повторю через минуту).", batchName(n, next), next.Qty, err)
+		return
+	}
+	next.State, next.StartedAt = BatchNext, now
+	w.btDirty[next.ID] = true
+	w.log.Add("ok", "%s выставлена заранее: по %d шт. (в партии %d осталось %d из %d).", batchName(n, next), next.Qty, w.num(active.ID), active.Qty-active.Sold, active.Qty)
 }
 
 // setPairStock выставляет обоим SKU пары одинаковый остаток (в тесте — только пишет в журнал).

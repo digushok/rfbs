@@ -25,6 +25,7 @@ type Profile struct {
 	// Партии — пары SKU по очереди. Старые поля SKU1/SKU2/StockQty — только для перехода с версий до 1.2.
 	Batches      []Batch `json:"batches"`
 	KeepOldStock bool    `json:"keep_old_stock"` // false (по умолчанию) — обнулять остаток старой пары при переключении
+	PrestockLeft *int    `json:"prestock_left"`  // за сколько заказов до конца партии выставлять следующую (nil — 3)
 	SKU1         int64   `json:"sku1,omitempty"`
 	SKU2         int64   `json:"sku2,omitempty"`
 	StockQty     int     `json:"stock_qty,omitempty"`
@@ -40,7 +41,8 @@ type Profile struct {
 // Состояния партии.
 const (
 	BatchQueued = "queued" // в очереди
-	BatchActive = "active" // продаётся сейчас
+	BatchActive = "active" // продаётся сейчас (основная)
+	BatchNext   = "next"   // следующая, выставлена заранее, пока основная распродаётся
 	BatchDone   = "done"   // распродана или переключена: заказы доводятся до конца, новые не ждём
 )
 
@@ -61,7 +63,19 @@ func (b *Batch) Matches(a, c int64) bool {
 }
 
 // Started — партия уже выставлялась (её заказы считаются целевыми).
-func (b *Batch) Started() bool { return b.State == BatchActive || b.State == BatchDone }
+func (b *Batch) Started() bool {
+	return b.State == BatchActive || b.State == BatchNext || b.State == BatchDone
+}
+
+const defaultPrestock = 3
+
+// Prestock — за сколько заказов до конца основной партии выставлять следующую (0 — только после распродажи).
+func (p *Profile) Prestock() int {
+	if p.PrestockLeft == nil {
+		return defaultPrestock
+	}
+	return *p.PrestockLeft
+}
 
 func (p *Profile) ActiveBatch() *Batch {
 	for i := range p.Batches {

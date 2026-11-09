@@ -71,7 +71,6 @@ function renderProfile(full = true) {
   $('#testReset').classList.toggle('hidden', p.live);
   $$('#modeSeg input').forEach(i => i.checked = (i.value === 'live') === p.live);
   if (!full) return;
-  $('#zeroOld').checked = !p.keep_old_stock;
   const ws = $('#whSel');
   if (!ws.options.length || ws.dataset.shop !== p.id) {
     ws.dataset.shop = p.id;
@@ -81,6 +80,7 @@ function renderProfile(full = true) {
   $('#sKey').value = ''; $('#sKey').placeholder = p.api_key_set ? 'сохранён (введите новый, чтобы заменить)' : '';
   $('#sName').disabled = false; $('#sClient').disabled = $('#sKey').disabled = p.demo;
   $('#pPause').value = p.pause_sec; $('#pMargin').value = p.margin_min; $('#pPoll').value = p.poll_sec; $('#pLook').value = p.lookback_days;
+  $('#pPrestock').value = p.prestock_left ?? 3; $('#pZeroOld').checked = !p.keep_old_stock;
 }
 
 function renderShops() {
@@ -131,7 +131,9 @@ function renderBatches() {
   const rows = started.map(b => {
     n++;
     const pct = b.qty > 0 ? Math.min(100, Math.round(b.sold / b.qty * 100)) : 0;
-    const st = b.state === 'active'
+    const st = b.state === 'next'
+      ? `<span class="chip ok">продаётся (заранее)</span> продано <b>${b.sold}</b> из ${b.qty}<div class="muted small">выставлена, пока распродаётся текущая · в работе ${b.in_work}${stock(b.sku1)}</div>`
+      : b.state === 'active'
       ? `<span class="chip next">продаётся</span> продано <b>${b.sold}</b> из ${b.qty}<div class="bar"><i style="width:${pct}%"></i></div><div class="muted small">в работе ${b.in_work}, доставлено ${b.delivered}${stock(b.sku1)}</div>`
       : `<span class="chip ${b.in_work ? 'warn' : 'ok'}">${b.in_work ? 'доставляется' : 'завершена'}</span> продано ${b.sold} из ${b.qty}<div class="muted small">в работе ${b.in_work}, доставлено ${b.delivered}</div>`;
     const act = b.state === 'done' && !b.in_work ? `<button class="btn ghost sm" data-rm="${b.id}" title="Убрать из списка. Её заказы всё равно будут доведены до конца.">Убрать</button>` : '';
@@ -344,19 +346,14 @@ $('#batchTable').addEventListener('click', async e => {
   }
 });
 $('#batchNext').onclick = async () => {
-  const src = batchSource(), a = src.find(b => b.state === 'active'), q = src.find(b => b.state === 'queued');
+  const src = batchSource(), a = src.find(b => b.state === 'active'), e = src.find(b => b.state === 'next'), q = src.find(b => b.state === 'queued');
   const msg = a ? `Партия ${a.num} (SKU ${a.sku1} + ${a.sku2}) будет завершена${S.profile.keep_old_stock ? '' : ', её остаток обнулён'}. ` : '';
-  const nx = q ? `Запустится партия ${q.num} (SKU ${q.sku1} + ${q.sku2}): остаток по ${q.qty} шт.` : 'В очереди нет партий — новая не запустится.';
+  const nx = e ? `Основной станет партия ${e.num} (SKU ${e.sku1} + ${e.sku2}) — она уже в наличии.`
+    : q ? `Запустится партия ${q.num} (SKU ${q.sku1} + ${q.sku2}): остаток по ${q.qty} шт.` : 'В очереди нет партий — новая не запустится.';
   if (!(await confirmBox(`<h3>Перейти к следующей партии?</h3><p>${msg}${nx}</p><p class="muted">Заказы завершённой партии будут доведены до конца.</p>`, 'Перейти'))) return;
   try { await api('/api/batches/next', { id: S.profile.id }); toast('Переключаю…'); setTimeout(refreshRun, 1500); } catch (er) { toast(er.message, true); }
 };
-$('#zeroOld').onchange = async e => {
-  try {
-    await api('/api/profile/save', { id: S.profile.id, keep_old_stock: !e.target.checked });
-    await loadState(false);
-    toast(e.target.checked ? 'Остаток старой пары будет обнуляться' : 'Остаток старой пары останется как есть');
-  } catch (er) { toast(er.message, true); }
-};
+
 $$('#modeSeg input').forEach(i => i.onchange = () => setMode(i.value === 'live'));
 $('#runBtn').onclick = toggleRun;
 $('#pollNow').onclick = async () => { await api('/api/run/now', { id: S.profile.id }); setTimeout(refreshRun, 1500); };
@@ -385,7 +382,8 @@ $('#sCheck').onclick = async () => {
 };
 $('#pSave').onclick = async () => {
   try {
-    await api('/api/profile/save', { id: S.profile.id, pause_sec: $('#pPause').value, margin_min: $('#pMargin').value, poll_sec: $('#pPoll').value, lookback_days: $('#pLook').value });
+    await api('/api/profile/save', { id: S.profile.id, pause_sec: $('#pPause').value, margin_min: $('#pMargin').value, poll_sec: $('#pPoll').value, lookback_days: $('#pLook').value,
+      prestock_left: $('#pPrestock').value, keep_old_stock: !$('#pZeroOld').checked });
     $('#pMsg').textContent = 'Сохранено'; setTimeout(() => $('#pMsg').textContent = '', 2500); await loadState();
   } catch (e) { toast(e.message, true); }
 };

@@ -20,6 +20,8 @@ func setupBatches(t *testing.T, live bool, qty [3]int, keep bool) (*Worker, *Moc
 	id, _ := store.Snapshot()
 	prof, _ := store.Update(id, func(p *Profile) {
 		p.Live, p.KeepOldStock, p.MarginMin = live, keep, 3
+		zero := 0
+		p.PrestockLeft = &zero // в этих тестах — переключение только после полной распродажи
 		for i := range p.Batches {
 			p.Batches[i].Qty = qty[i]
 		}
@@ -153,5 +155,77 @@ func TestBatchMigrationFromSinglePair(t *testing.T) {
 	p.normalize()
 	if len(p.Batches) != 1 || p.Batches[0].State != BatchActive || p.Batches[0].Qty != 25 || p.SKU1 != 0 {
 		t.Fatalf("старые настройки не перенесены: %+v", p)
+	}
+}
+
+func setPrestock(store *Store, id string, n int) {
+	store.Update(id, func(p *Profile) { p.PrestockLeft = &n })
+}
+
+// Следующая партия выставляется заранее, когда до конца текущей осталось 3 заказа.
+func TestPrestockNextBatch(t *testing.T) {
+	w, m, _, store, id := setupBatches(t, true, [3]int{5, 3, 4}, false)
+	setPrestock(store, id, 3)
+	ctx := context.Background()
+	w.Tick(ctx)
+	m.AddPosting("target")
+	w.Tick(ctx)
+	if st := states(store, id); st[1] != BatchQueued {
+		t.Fatalf("осталось 4 из 5 — рано выставлять следующую: %v", st)
+	}
+	m.AddPosting("target")
+	w.Tick(ctx)
+	if st := states(store, id); st[0] != BatchActive || st[1] != BatchNext || st[2] != BatchQueued {
+		t.Fatalf("осталось 3 из 5 — вторая партия должна выставиться заранее: %v", st)
+	}
+	if m.stock[mockSKU3] != 3 || m.stock[mockSKU1] != 3 {
+		t.Fatalf("в наличии должны быть обе пары: %v", m.stock)
+	}
+	// Третья партия не выставляется, пока вторая не стала основной (не больше двух пар в продаже).
+	w.Tick(ctx)
+	if st := states(store, id); st[2] != BatchQueued {
+		t.Fatalf("третья партия не должна выставляться: %v", st)
+	}
+	// Заказ второй пары, пока первая ещё продаётся, — целевой и считается во вторую партию.
+	p2 := m.AddPosting("target")
+	p2.Products[0].SKU, p2.Products[1].SKU = mockSKU3, mockSKU4
+	m.stock[mockSKU1]++ // демо списало остаток с первой пары — возвращаем
+	m.stock[mockSKU2]++
+	m.stock[mockSKU3]--
+	m.stock[mockSKU4]--
+	w.Tick(ctx)
+	// Дораспродаём первую.
+	for i := 0; i < 3; i++ {
+		m.AddPosting("target")
+	}
+	w.Tick(ctx)
+	p, _ := store.Get(id)
+	if p.Batches[0].State != BatchDone || p.Batches[1].State != BatchActive || p.Batches[0].Sold != 5 || p.Batches[1].Sold != 1 {
+		t.Fatalf("после распродажи первой вторая должна стать основной: %+v", p.Batches)
+	}
+	// У второй (3 шт.) осталось 2 ≤ 3 — третья выставляется заранее сразу.
+	if p.Batches[2].State != BatchNext || m.stock[mockSKU5] != 4 {
+		t.Fatalf("третья партия должна выставиться заранее: %+v, stock %v", p.Batches, m.stock)
+	}
+}
+
+// Ручное переключение, когда следующая уже выставлена заранее: она просто становится основной.
+func TestPrestockManualSwitch(t *testing.T) {
+	w, m, _, store, id := setupBatches(t, true, [3]int{3, 10, 4}, false)
+	setPrestock(store, id, 3)
+	ctx := context.Background()
+	w.Tick(ctx) // первая (3 шт.) — сразу порог: выставлена и вторая
+	if st := states(store, id); st[0] != BatchActive || st[1] != BatchNext {
+		t.Fatalf("маленькая партия: вторая должна выставиться сразу: %v", st)
+	}
+	calls := m.Calls["/v2/products/stocks"]
+	w.RequestSwitch()
+	w.Tick(ctx)
+	if st := states(store, id); st[0] != BatchDone || st[1] != BatchActive || st[2] != BatchQueued {
+		t.Fatalf("ожидали: первая завершена, вторая основная, третья в очереди: %v", st)
+	}
+	// Только обнуление первой пары (2 запроса), вторую заново не выставляем.
+	if d := m.Calls["/v2/products/stocks"] - calls; d != 2 || m.stock[mockSKU3] != 10 {
+		t.Fatalf("лишние запросы остатков: %d, stock %v", d, m.stock)
 	}
 }

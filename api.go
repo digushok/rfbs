@@ -154,6 +154,10 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			if v, ok := b["keep_old_stock"].(bool); ok {
 				p.KeepOldStock = v
 			}
+			if v, ok := num(b, "prestock_left"); ok && v >= 0 {
+				n := int(v)
+				p.PrestockLeft = &n
+			}
 			if v, ok := num(b, "pause_sec"); ok {
 				p.PauseSec = int(v)
 			}
@@ -368,8 +372,8 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			var out []Batch
 			for _, bt := range p.Batches {
 				if bt.ID == bid {
-					if bt.State == BatchActive {
-						err = fmt.Errorf("активную партию удалить нельзя — сначала переключитесь на следующую")
+					if bt.State == BatchActive || bt.State == BatchNext {
+						err = fmt.Errorf("партию, которая сейчас в продаже, удалить нельзя — сначала переключитесь на следующую")
 					} else {
 						continue
 					}

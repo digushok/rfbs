@@ -55,7 +55,6 @@
       <div class="row wrap">
         <button class="btn primary hidden" id="batchSave">Сохранить очередь</button>
         <span id="batchDirty" class="chip warn hidden">очередь изменена — не забудьте сохранить</span>
-        <label class="switch"><input type="checkbox" id="zeroOld"> Обнулять остаток старой пары при переключении</label>
         <button class="btn ghost sm" id="stockApply" title="Ещё раз выставить остаток активной партии">Выставить остаток активной партии заново</button>
       </div>
       <div id="stockMsg" class="msgs"></div>
@@ -138,6 +137,13 @@
         <label class="fld">Запас до конца окна доставки, мин.<input type="number" id="pMargin" min="0"></label>
         <label class="fld">Опрашивать Ozon каждые, сек.<input type="number" id="pPoll" min="15"></label>
         <label class="fld">Смотреть заказы за последние, дн.<input type="number" id="pLook" min="1"></label>
+      </div>
+      <h3 class="subh">Партии</h3>
+      <div class="form2">
+        <label class="fld">Выставлять следующую партию, когда до конца текущей осталось, заказов
+          <input type="number" id="pPrestock" min="0" title="0 — только после того, как текущая партия распродана полностью"></label>
+        <span class="muted small self-end">Например, 3: в партии на 25 после 22-го заказа следующая пара уже выставляется в наличие. Одновременно в продаже не больше двух пар. 0 — следующая выставляется только после полной распродажи.</span>
+        <label class="switch"><input type="checkbox" id="pZeroOld"> Обнулять остаток старой пары, когда партия завершена</label>
       </div>
       <div class="row"><button class="btn primary" id="pSave">Сохранить</button><span id="pMsg" class="muted"></span></div>
     </div>
