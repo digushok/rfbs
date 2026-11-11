@@ -175,6 +175,10 @@ type Worker struct {
 	switchReq   bool // вручную: перейти к следующей партии
 	activateAt  time.Time
 	productInfo map[int64]*ProductInfo
+
+	stockCheckAt time.Time // следующая проверка остатков завершённых пар
+	completed    bool      // очередь окончена — работник ждёт остановки
+	onDone       func()    // вызывается, когда очередь окончена
 }
 
 func NewWorker(prof Profile, client *Client, journal *Journal, log *ShopLog) *Worker {
@@ -365,6 +369,9 @@ func (w *Worker) fetch(ctx context.Context, now time.Time) ([]*Posting, error) {
 
 // Tick — один цикл: прочитать заказы и выполнить всё, что пора. Возвращает время ближайшего дела.
 func (w *Worker) Tick(ctx context.Context) time.Time {
+	if w.completed {
+		return time.Time{}
+	}
 	now := w.now()
 	postings, err := w.fetch(ctx, now)
 	w.mu.Lock()
@@ -424,11 +431,18 @@ func (w *Worker) Tick(ctx context.Context) time.Time {
 			pend = append(pend, a)
 		}
 	}
-	pend = append(pend, w.planDelivered(now)...)
-	w.execute(ctx, pend, now)
-	w.manageBatches(ctx, now)
+	if w.pauseStock(ctx) { // на паузе статусы не меняются и партии не переключаются
+		pend = append(pend, w.planDelivered(now)...)
+		w.execute(ctx, pend, now)
+		w.manageBatches(ctx, now)
+	}
+	w.checkDoneStock(ctx, now)
 	w.flushBatches()
 	w.journal.Save()
+	if w.checkComplete(now) {
+		w.flushBatches()
+		w.journal.Save()
+	}
 
 	views, nextDue := w.buildViews(now)
 	sort.Slice(skipped, func(i, j int) bool { return skipped[i].Created.After(skipped[j].Created) })
@@ -851,6 +865,11 @@ type WorkerStatus struct {
 	Postings []PostingView `json:"postings"`
 	Batches  []BatchView   `json:"batches"`
 	Skipped  []SkipView    `json:"skipped"`
+
+	Paused    bool   `json:"paused"`
+	Finishing bool   `json:"finishing"`
+	StockOff  bool   `json:"stock_off"`
+	QueueName string `json:"queue_name,omitempty"`
 }
 
 func (w *Worker) Status() WorkerStatus {
@@ -913,6 +932,7 @@ func (m *Manager) start(id string) error {
 	m.stop(id, false)
 	w := NewWorker(p, NewClient(&p, m.mocks), LoadJournal(m.journalPath(&p)), m.Log(id))
 	w.store = m.store
+	w.onDone = func() { go m.workerDone(id, w) }
 	m.mu.Lock()
 	m.workers[id] = w
 	m.mu.Unlock()
@@ -942,6 +962,18 @@ func (m *Manager) stop(id string, persist bool) {
 	m.updateAwake()
 }
 
+// workerDone останавливает работника, у которого очередь окончена.
+func (m *Manager) workerDone(id string, w *Worker) {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+	m.mu.Lock()
+	same := m.workers[id] == w
+	m.mu.Unlock()
+	if same {
+		m.stop(id, false)
+	}
+}
+
 // updateAwake не даёт Windows уснуть, пока работает автоматизация хотя бы одного магазина.
 func (m *Manager) updateAwake() {
 	m.mu.Lock()
@@ -968,11 +1000,16 @@ func (m *Manager) Status(id string) WorkerStatus {
 	m.mu.Lock()
 	w := m.workers[id]
 	m.mu.Unlock()
+	p, _ := m.store.Get(id)
+	var st WorkerStatus
 	if w == nil {
-		p, _ := m.store.Get(id)
-		return WorkerStatus{Live: p.Live}
+		st = WorkerStatus{Live: p.Live}
+	} else {
+		st = w.Status()
+		st.Paused, st.Finishing, st.StockOff = p.Paused, p.Finishing, p.StockOff
 	}
-	return w.Status()
+	st.QueueName = p.QueueName
+	return st
 }
 
 // ResetInfo — что произойдёт при сбросе очереди (для предупреждения).
@@ -1031,9 +1068,130 @@ func (m *Manager) ResetPreview(id string) (ResetInfo, error) {
 	return info, err
 }
 
-// ResetQueue — «Сбросить очередь»: автоматизация выключается, пары в продаже обнуляются (если включено),
-// недоставленные заказы бросаются, список партий очищается.
-func (m *Manager) ResetQueue(ctx context.Context, id string) (info ResetInfo, warning string, err error) {
+// StartQueue — кнопка «Начать»: с сохранённой очереди (tplID) или с партий в таблице.
+func (m *Manager) StartQueue(id, tplID string) error {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+	if m.IsRunning(id) {
+		return fmt.Errorf("очередь уже идёт")
+	}
+	var lerr error
+	var name string
+	_, err := m.store.Update(id, func(p *Profile) {
+		var tpl *QueueTemplate
+		if tplID != "" {
+			for i := range p.Templates {
+				if p.Templates[i].ID == tplID {
+					tpl = &p.Templates[i]
+				}
+			}
+			if tpl == nil {
+				lerr = fmt.Errorf("сохранённая очередь не найдена")
+				return
+			}
+		}
+		now := time.Now()
+		var out []Batch
+		for _, b := range p.Batches {
+			switch b.State {
+			case BatchDone, BatchSkip: // прошлая очередь: её заказы, если остались, всё равно доводятся по журналу
+				continue
+			case BatchActive, BatchNext:
+				if tpl != nil { // пара прошлой очереди ещё в продаже — завершаем, программа обнулит её остаток
+					b.State, b.FinishedAt, b.ZeroDone, b.Keep = BatchDone, now, false, false
+				}
+			case BatchQueued:
+				if tpl != nil {
+					continue
+				}
+			}
+			out = append(out, b)
+		}
+		if tpl != nil {
+			for _, row := range tpl.Rows {
+				out = append(out, Batch{ID: newID(), SKU1: row.SKU1, SKU2: row.SKU2, Qty: row.Qty, State: BatchQueued})
+			}
+			name = tpl.Name
+		}
+		open := 0
+		for _, b := range out {
+			if b.State != BatchDone {
+				open++
+			}
+		}
+		if open == 0 {
+			lerr = fmt.Errorf("в очереди нет партий — выберите сохранённую очередь или добавьте партии")
+			return
+		}
+		p.Batches, p.QueueName = out, name
+		p.Paused, p.Finishing, p.StockOff = false, false, false
+	})
+	if err == nil {
+		err = lerr
+	}
+	if err != nil {
+		return err
+	}
+	if name != "" {
+		m.Log(id).Add("info", "Начата очередь «%s».", name)
+	} else {
+		m.Log(id).Add("info", "Начата очередь из таблицы партий.")
+	}
+	return m.start(id)
+}
+
+// SetPaused — кнопки «Пауза» / «Продолжить». Остаток обнуляет и возвращает работник в ближайшем цикле.
+func (m *Manager) SetPaused(id string, paused bool) error {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+	if !m.IsRunning(id) {
+		return fmt.Errorf("очередь не запущена")
+	}
+	var lerr error
+	_, err := m.store.Update(id, func(p *Profile) {
+		if p.Finishing {
+			lerr = fmt.Errorf("очередь заканчивается — пауза недоступна")
+			return
+		}
+		p.Paused = paused
+	})
+	if err == nil {
+		err = lerr
+	}
+	if err != nil {
+		return err
+	}
+	if paused {
+		m.Log(id).Add("info", "Очередь поставлена на паузу.")
+	} else {
+		m.Log(id).Add("info", "Очередь продолжена.")
+	}
+	m.Kick(id)
+	return nil
+}
+
+// FinishDeliver — «Закончить» → «Доставить оставшиеся и закончить»: пары в продаже обнуляются (если включено),
+// новые партии не запускаются; когда все заказы доставлены, программа останавливается сама.
+func (m *Manager) FinishDeliver(id string) error {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+	if !m.IsRunning(id) {
+		return fmt.Errorf("очередь не запущена")
+	}
+	if _, err := m.store.Update(id, func(p *Profile) {
+		// Если была пауза, остаток уже обнулён: возвращать его не нужно.
+		p.Finishing, p.Paused, p.StockOff = true, false, false
+	}); err != nil {
+		return err
+	}
+	m.Log(id).Add("info", "Очередь заканчивается: новые партии не запускаются, оставшиеся заказы будут доставлены, затем программа остановится.")
+	m.Kick(id)
+	return nil
+}
+
+// FinishAbandon — «Закончить» → «Бросить сейчас»: работа останавливается, пары в продаже обнуляются (если включено),
+// недоставленные заказы бросаются. Партии в очереди помечаются «не начата».
+func (m *Manager) FinishAbandon(ctx context.Context, id string) (info ResetInfo, warning string, err error) {
 	m.opMu.Lock()
 	defer m.opMu.Unlock()
 	info, p, err := m.resetInfo(id)
@@ -1043,6 +1201,7 @@ func (m *Manager) ResetQueue(ctx context.Context, id string) (info ResetInfo, wa
 	m.stop(id, true)
 	log := m.Log(id)
 	var errs []string
+	zeroed := map[string]bool{}
 	if info.Zero && p.WarehouseID != 0 {
 		c := NewClient(&p, m.mocks)
 		c.readOnly = !p.Live
@@ -1050,6 +1209,8 @@ func (m *Manager) ResetQueue(ctx context.Context, id string) (info ResetInfo, wa
 		for i := range info.OnSale {
 			if err := w.setPairStock(ctx, &info.OnSale[i], 0); err != nil {
 				errs = append(errs, fmt.Sprintf("SKU %d + %d: %v", info.OnSale[i].SKU1, info.OnSale[i].SKU2, err))
+			} else {
+				zeroed[info.OnSale[i].ID] = true
 			}
 		}
 	}
@@ -1057,19 +1218,34 @@ func (m *Manager) ResetQueue(ctx context.Context, id string) (info ResetInfo, wa
 	now := time.Now()
 	for _, e := range j.All() {
 		if e.Final == "" && e.Stage >= 0 && !e.Abandoned {
-			e.Abandoned, e.Final, e.FinalAt, e.DueAt = true, "брошен при сбросе очереди", now, time.Time{}
+			e.Abandoned, e.Final, e.FinalAt, e.DueAt = true, "брошен при завершении очереди", now, time.Time{}
 		}
 	}
 	j.MarkDirty()
 	j.Save()
-	m.store.Update(id, func(pp *Profile) { pp.Batches, pp.Running = nil, false })
-	log.Add("warn", "Очередь сброшена: партий больше нет, автоматизация выключена. Брошено недоставленных заказов: %d.%s",
-		len(info.Undeliver), map[bool]string{true: " Остаток пар в продаже обнулён.", false: ""}[info.Zero && len(info.OnSale) > 0])
+	m.store.Update(id, func(pp *Profile) {
+		pp.Running, pp.Paused, pp.Finishing, pp.StockOff = false, false, false, false
+		if !pp.Live {
+			return // в тестовом режиме состояние партий не сохраняется
+		}
+		for i := range pp.Batches {
+			b := &pp.Batches[i]
+			switch b.State {
+			case BatchActive, BatchNext:
+				b.State, b.FinishedAt = BatchDone, now
+				b.ZeroDone, b.Keep = zeroed[b.ID] || !info.Zero, !info.Zero
+			case BatchQueued:
+				b.State = BatchSkip
+			}
+		}
+	})
+	log.Add("warn", "Очередь закончена досрочно: программа остановлена. Брошено недоставленных заказов: %d.%s",
+		len(info.Undeliver), map[bool]string{true: " Остаток пар в продаже обнулён.", false: ""}[info.Zero && len(info.OnSale) > 0 && len(errs) == 0])
 	for _, u := range info.Undeliver {
 		log.Add("warn", "Заказ %s брошен (этап «%s», окно до %s) — статусы больше не меняются, переведите его вручную.", u.PostingNumber, u.Stage, u.WindowEnd.Local().Format("02.01 15:04"))
 	}
 	if len(errs) > 0 {
-		warning = "Очередь сброшена, но остаток обнулить не удалось: " + strings.Join(errs, "; ") + ". Обнулите его вручную в кабинете Ozon."
+		warning = "Очередь закончена, но остаток обнулить не удалось: " + strings.Join(errs, "; ") + ". Обнулите его вручную в кабинете Ozon."
 		log.Add("err", "%s", warning)
 	}
 	return info, warning, nil
@@ -1081,7 +1257,7 @@ func (m *Manager) SwitchNext(id string) error {
 	w := m.workers[id]
 	m.mu.Unlock()
 	if w == nil {
-		return fmt.Errorf("запустите автоматизацию — переключение партий выполняет она")
+		return fmt.Errorf("сначала начните очередь — переключение партий выполняет она")
 	}
 	w.RequestSwitch()
 	return nil
@@ -1138,7 +1314,7 @@ func (m *Manager) ApplyStock(ctx context.Context, id string, qty int) ([]string,
 	}
 	b := p.ActiveBatch()
 	if b == nil {
-		return nil, fmt.Errorf("нет активной партии — запустите автоматизацию, она выставит остаток первой партии сама")
+		return nil, fmt.Errorf("нет партии в продаже — начните очередь, программа выставит остаток первой партии сама")
 	}
 	c := NewClient(&p, m.mocks)
 	c.readOnly = !p.Live

@@ -39,6 +39,7 @@ main { max-width: 1280px; margin: 0 auto; padding: 8px 24px 80px; }
 /* карточки */
 .card { background: var(--card); border-radius: var(--r-lg); padding: 20px 22px; margin-bottom: 16px; box-shadow: var(--shadow); }
 .card-h { display: flex; align-items: center; gap: 14px; margin-bottom: 16px; flex-wrap: wrap; }
+.card-h > div:not(.actions) { flex: 1 1 320px; min-width: 0; }
 .card-h h2 { font-size: 16px; font-weight: 600; margin: 0; }
 .card-h .sub { margin: 2px 0 0; font-size: 12.5px; color: var(--muted); }
 .card-h .actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
@@ -187,3 +188,17 @@ input.full { width: 100%; margin-top: 6px; }
 .self-end { align-self: end; }
 .batches tr.next td { background: #f6faf3; }
 .switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px; }
+/* управление очередью */
+.qbar { display: flex; flex-direction: column; gap: 8px; padding: 14px 16px; margin: 0 0 14px; background: var(--field); border-radius: var(--r-md); }
+.qbar .tplsel { min-height: 44px; }
+.qstate { font-size: 15px; font-weight: 600; margin-right: 6px; }
+.qstate.run { color: var(--ok); }
+.qstate.pause { color: var(--warn); }
+.qstate.fin { color: var(--accent); }
+.batches tr.skipped td { color: var(--muted); }
+.banner .row { margin-top: 8px; }
+.wh select { min-width: 0; }
+.dot.on.pause { background: var(--warn); box-shadow: 0 0 0 4px var(--warn-soft); }
+.modal-btns { display: flex; flex-direction: column; gap: 8px; margin-top: 14px; }
+.modal-btns .btn { width: 100%; justify-content: center; }
+@media (max-width: 600px) { .tplsel { min-width: 0; width: 100%; } .qbar .btn.lg { flex: 1; } }

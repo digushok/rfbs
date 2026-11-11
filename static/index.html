@@ -29,56 +29,9 @@
   <section id="tab-orders" class="tab">
     <div id="demoNote" class="banner hidden"><b>Демо-магазин.</b> Запросы идут в демо-Озон внутри программы, в настоящий магазин ничего не отправляется. Новые демо-заказы появляются примерно раз в 2 минуты, окно доставки у них около 10 минут.</div>
     <div id="keyNote" class="banner warn hidden">Чтобы начать, укажите Client-Id и API-ключ во вкладке «Настройки».</div>
-    <div id="testNote" class="banner test hidden"><b>Тестовый режим.</b> Программа читает настоящие заказы из Ozon и показывает, что и когда она сделала бы. Статусы и остатки в Ozon <b>не меняются</b>. Шаги симулируются и пишутся в журнал с пометкой [ТЕСТ].</div>
-    <div id="liveNote" class="banner err hidden"><b>Боевой режим.</b> Программа по-настоящему меняет статусы заказов и остатки в Ozon.</div>
-
-    <div class="card">
-      <div class="card-h"><span class="step">1</span><div><h2>Склад</h2><p class="sub">Один склад для всех партий</p></div></div>
-      <div class="row tight wh">
-        <select id="whSel" class="grow"></select>
-        <button class="btn ghost sm" id="whReload" title="Загрузить склады из Ozon">↻</button>
-        <button class="btn primary" id="cfgSave">Сохранить</button><span id="cfgMsg" class="muted"></span>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="card-h"><span class="step">2</span><div><h2>Партии</h2><p class="sub">Пары SKU по очереди. Целевой заказ — ровно эти 2 SKU по 1 шт. Когда партия распродана, программа сама запускает следующую: выставляет ей остаток</p></div>
-        <div class="actions">
-          <button class="btn soft" id="batchAdd">+ Партия</button>
-          <button class="btn ghost" id="batchNext" title="Завершить текущую партию и запустить следующую из очереди">Следующая партия →</button>
-        </div>
-      </div>
-      <div class="row wrap tplbar">
-        <select id="tplSel" class="tplsel"></select>
-        <button class="btn soft sm" id="tplLoad">Загрузить очередь</button>
-        <button class="btn ghost sm" id="tplSaveAs">Сохранить текущую как…</button>
-        <span class="grow"></span>
-        <button class="btn danger sm" id="queueReset" title="Удалить все партии и выключить автоматизацию">Сбросить очередь</button>
-      </div>
-      <div class="scroll"><table class="grid batches" id="batchTable">
-        <thead><tr><th style="width:44px">№</th><th>SKU 1</th><th>SKU 2</th><th class="r" style="width:110px">Кол-во, шт.</th><th style="width:300px">Состояние</th><th style="width:120px"></th></tr></thead>
-        <tbody></tbody>
-      </table></div>
+    <div id="whNote" class="banner warn hidden">Выберите склад во вкладке «Настройки» → «Магазин».</div>
+    <div id="testNote" class="banner test hidden"><b>Тестовый режим.</b> Программа читает настоящие заказы из Ozon и показывает, что и когда она сделала бы. Статусы и остатки в Ozon <b>не меняются</b>, шаги пишутся в журнал с пометкой [ТЕСТ]. Выключается в «Настройках».
       <div class="row wrap">
-        <button class="btn primary hidden" id="batchSave">Сохранить очередь</button>
-        <span id="batchDirty" class="chip warn hidden">очередь изменена — не забудьте сохранить</span>
-        <button class="btn ghost sm" id="stockApply" title="Ещё раз выставить остаток активной партии">Выставить остаток активной партии заново</button>
-      </div>
-      <div id="stockMsg" class="msgs"></div>
-    </div>
-
-    <div class="card">
-      <div class="card-h"><span class="step">3</span><div><h2>Автоматизация</h2><p class="sub">Собрать → Доставляется → Курьер в пути (пауза между шагами) → Условно доставлен перед концом окна доставки</p></div></div>
-      <div class="auto">
-        <div class="seg big" id="modeSeg">
-          <label><input type="radio" name="mode" value="test"><span>🧪 Тестовый режим</span></label>
-          <label><input type="radio" name="mode" value="live"><span>⚡ Боевой режим</span></label>
-        </div>
-        <button class="btn primary lg" id="runBtn">Запустить</button>
-        <div class="runinfo" id="runInfo"></div>
-      </div>
-      <div class="row wrap">
-        <button class="btn soft sm" id="pollNow">Проверить заказы сейчас</button>
         <button class="btn ghost sm" id="testReset" title="Забыть симулированные шаги и прогнать тест заново">Сбросить тестовый прогон</button>
         <span id="demoBtns" class="hidden">
           <span class="muted small">Демо-заказ:</span>
@@ -91,7 +44,42 @@
     </div>
 
     <div class="card">
-      <div class="card-h"><span class="step">4</span><div><h2>Целевые заказы <span class="muted" id="ordersCount"></span></h2><p class="sub" id="ordersSub">Время — по часам этого компьютера. «~» — запланировано, «✓» — выполнено</p></div></div>
+      <div class="card-h"><span class="step">1</span><div><h2>Очередь <span class="muted" id="whName"></span></h2><p class="sub">Пары SKU по очереди. Целевой заказ — ровно эти 2 SKU по 1 шт. Собрать → Доставляется → Курьер в пути → Условно доставлен перед концом окна. Распродана партия — запускается следующая</p></div>
+        <div class="actions">
+          <button class="btn soft" id="batchAdd">+ Партия</button>
+          <button class="btn ghost hidden" id="batchNext" title="Завершить текущую партию и запустить следующую из очереди">Следующая партия →</button>
+        </div>
+      </div>
+      <div class="qbar" id="qbar">
+        <div class="row wrap tight" id="qIdle">
+          <select id="tplSel" class="tplsel"></select>
+          <button class="btn primary lg" id="qStart">▶ Начать</button>
+        </div>
+        <div class="row wrap tight hidden" id="qRun">
+          <span id="qState" class="qstate"></span>
+          <button class="btn soft lg" id="qPause">⏸ Пауза</button>
+          <button class="btn stop lg" id="qFinish">■ Закончить</button>
+        </div>
+        <div class="runinfo" id="runInfo"></div>
+      </div>
+      <div class="scroll"><table class="grid batches" id="batchTable">
+        <thead><tr><th style="width:44px">№</th><th>SKU 1</th><th>SKU 2</th><th class="r" style="width:110px">Кол-во, шт.</th><th style="width:300px">Состояние</th><th style="width:120px"></th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <div class="row wrap">
+        <button class="btn primary hidden" id="batchSave">Сохранить очередь</button>
+        <span id="batchDirty" class="chip warn hidden">очередь изменена — не забудьте сохранить</span>
+        <span class="grow"></span>
+        <span id="tplRunBox" class="hidden"><button class="btn ghost sm" id="tplLoad" title="Заменить партии «в очереди» партиями выбранной сохранённой очереди">Заменить очередь…</button></span>
+        <button class="btn ghost sm" id="tplSaveAs">Сохранить как…</button>
+        <button class="btn ghost sm hidden" id="stockApply" title="Ещё раз выставить остаток партии в продаже">Выставить остаток заново</button>
+        <button class="btn ghost sm hidden" id="pollNow">Проверить заказы сейчас</button>
+      </div>
+      <div id="stockMsg" class="msgs"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-h"><span class="step">2</span><div><h2>Целевые заказы <span class="muted" id="ordersCount"></span></h2><p class="sub" id="ordersSub">Время — по часам этого компьютера. «~» — запланировано, «✓» — выполнено</p></div></div>
       <div class="scroll tablebox"><table class="grid" id="ordersTable">
         <thead><tr><th>Отправление</th><th>Окно доставки</th><th>Собрать</th><th>Доставляется</th><th>Курьер в пути</th><th>Условно доставлен</th><th>Сейчас</th></tr></thead>
         <tbody></tbody>
@@ -132,9 +120,16 @@
         <label class="fld">Название<input id="sName"></label>
         <label class="fld">Client-Id<input id="sClient" autocomplete="off"></label>
         <label class="fld">API-ключ<input id="sKey" type="password" autocomplete="new-password"></label>
-        <span></span>
+        <label class="fld">Склад (один для всех партий)
+          <span class="row tight wh"><select id="whSel" class="grow"></select><button class="btn ghost sm" id="whReload" title="Загрузить склады из Ozon">↻</button></span></label>
       </div>
       <div class="row"><button class="btn primary" id="sSave">Сохранить</button><button class="btn soft" id="sCheck">Проверить подключение</button><span id="sMsg" class="muted"></span></div>
+    </div>
+
+    <div class="card">
+      <div class="card-h"><div><h2>Тестовый режим</h2><p class="sub">Обычно выключен: программа работает по-настоящему. В тестовом режиме она читает заказы из Ozon, но ничего в нём не меняет — только пишет в журнал, что и когда сделала бы</p></div></div>
+      <label class="switch"><input type="checkbox" id="pTest"> Тестовый режим (в Ozon ничего не меняется)</label>
+      <p class="muted small">Переключать можно, когда очередь не идёт.</p>
     </div>
 
     <div class="card">
@@ -150,14 +145,14 @@
         <label class="fld">Выставлять следующую партию, когда до конца текущей осталось, заказов
           <input type="number" id="pPrestock" min="0" title="0 — только после того, как текущая партия распродана полностью"></label>
         <span class="muted small self-end">Например, 3: в партии на 25 после 22-го заказа следующая пара уже выставляется в наличие. Одновременно в продаже не больше двух пар. 0 — следующая выставляется только после полной распродажи.</span>
-        <label class="switch"><input type="checkbox" id="pZeroOld"> Обнулять остаток старой пары, когда партия завершена</label>
-        <label class="switch"><input type="checkbox" id="pZeroReset"> Обнулять остаток пар в продаже при сбросе очереди</label>
+        <label class="switch"><input type="checkbox" id="pZeroOld"> Обнулять остаток старой пары, когда партия завершена (и проверять его раз в 10 минут)</label>
+        <label class="switch"><input type="checkbox" id="pZeroReset"> Обнулять остаток пар в продаже, когда очередь заканчивают кнопкой «Закончить»</label>
       </div>
       <div class="row"><button class="btn primary" id="pSave">Сохранить</button><span id="pMsg" class="muted"></span></div>
     </div>
 
     <div class="card">
-      <div class="card-h"><div><h2>Сохранённые очереди</h2><p class="sub">Готовые наборы пар SKU с количеством. На вкладке «Заказы» очередь выбирается в списке и загружается одним нажатием</p></div>
+      <div class="card-h"><div><h2>Сохранённые очереди</h2><p class="sub">Готовые наборы пар SKU с количеством. На вкладке «Заказы» очередь выбирается в списке и начинается кнопкой «Начать»</p></div>
         <div class="actions"><button class="btn soft" id="tplNew">+ Новая очередь</button></div></div>
       <div id="tplList" class="tpls"></div>
     </div>
@@ -178,7 +173,7 @@
       <div class="card-h"><div><h2>Данные программы</h2><p class="sub">Ключи, настройки, журналы и логи хранятся здесь и не пропадают при замене .exe</p></div>
         <div class="actions"><button class="btn ghost" id="dOpen">Открыть папку</button></div></div>
       <div class="pathbox muted" id="dataDir"></div>
-      <p class="muted small">Программа работает, пока она запущена и компьютер включён. Закрытие вкладки браузера её не останавливает. Чтобы выйти, нажмите ⏻. При следующем запуске включённая автоматизация продолжит работу сама.</p>
+      <p class="muted small">Программа работает, пока она запущена и компьютер включён. Закрытие вкладки браузера её не останавливает. Чтобы выйти, нажмите ⏻. При следующем запуске идущая очередь продолжится сама.</p>
     </div>
   </section>
 </main>

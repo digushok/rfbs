@@ -150,7 +150,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 		var shops []map[string]any
 		var cur *profileOut
 		for _, p := range list {
-			shops = append(shops, map[string]any{"id": p.ID, "name": p.Name, "demo": p.Demo, "live": p.Live, "running": s.mgr.IsRunning(p.ID)})
+			shops = append(shops, map[string]any{"id": p.ID, "name": p.Name, "demo": p.Demo, "live": p.Live, "running": s.mgr.IsRunning(p.ID), "paused": p.Paused})
 			if p.ID == active {
 				cur = &profileOut{Profile: p, APIKeySet: p.APIKey != ""}
 			}
@@ -163,6 +163,12 @@ func (s *Server) Routes(mux *http.ServeMux) {
 		old, ok := s.store.Get(id)
 		if !ok {
 			return nil, fmt.Errorf("магазин не найден")
+		}
+		if v, ok := b["live"].(bool); ok && v != old.Live && s.mgr.IsRunning(id) {
+			return nil, fmt.Errorf("тестовый режим можно включить или выключить, только когда очередь не идёт — сначала нажмите «Закончить»")
+		}
+		if v, ok := num(b, "warehouse_id"); ok && v != old.WarehouseID && s.mgr.IsRunning(id) {
+			return nil, fmt.Errorf("склад можно сменить, только когда очередь не идёт — сначала нажмите «Закончить»")
 		}
 		p, err := s.store.Update(id, func(p *Profile) {
 			if _, ok := b["name"]; ok {
@@ -209,9 +215,9 @@ func (s *Server) Routes(mux *http.ServeMux) {
 		}
 		if old.Live != p.Live {
 			if p.Live {
-				s.mgr.Log(id).Add("warn", "Включён БОЕВОЙ режим.")
+				s.mgr.Log(id).Add("warn", "Тестовый режим выключен: программа работает по-настоящему.")
 			} else {
-				s.mgr.Log(id).Add("info", "Включён тестовый режим.")
+				s.mgr.Log(id).Add("info", "Включён тестовый режим: в Ozon ничего не меняется.")
 			}
 		}
 		// Перезапуск автоматизации с новыми настройками.
@@ -418,18 +424,31 @@ func (s *Server) Routes(mux *http.ServeMux) {
 		return map[string]any{"ok": true}, err
 	})
 
-	s.handle(mux, "/api/batches/reset-preview", func(r *http.Request, b map[string]any) (any, error) {
+	s.handle(mux, "/api/queue/start", func(r *http.Request, b map[string]any) (any, error) {
+		return map[string]any{"ok": true}, s.mgr.StartQueue(s.id(r, b), str(b, "template_id"))
+	})
+	s.handle(mux, "/api/queue/pause", func(r *http.Request, b map[string]any) (any, error) {
+		v, _ := b["paused"].(bool)
+		return map[string]any{"ok": true}, s.mgr.SetPaused(s.id(r, b), v)
+	})
+	s.handle(mux, "/api/queue/finish-preview", func(r *http.Request, b map[string]any) (any, error) {
 		return s.mgr.ResetPreview(s.id(r, b))
 	})
-
-	s.handle(mux, "/api/batches/reset", func(r *http.Request, b map[string]any) (any, error) {
-		ctx, cancel := ctx30()
-		defer cancel()
-		info, warning, err := s.mgr.ResetQueue(ctx, s.id(r, b))
-		if err != nil {
-			return nil, err
+	s.handle(mux, "/api/queue/finish", func(r *http.Request, b map[string]any) (any, error) {
+		id := s.id(r, b)
+		switch str(b, "mode") {
+		case "deliver":
+			return map[string]any{"ok": true}, s.mgr.FinishDeliver(id)
+		case "abandon":
+			ctx, cancel := ctx30()
+			defer cancel()
+			info, warning, err := s.mgr.FinishAbandon(ctx, id)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"ok": true, "warning": warning, "abandoned": len(info.Undeliver)}, nil
 		}
-		return map[string]any{"ok": true, "warning": warning, "abandoned": len(info.Undeliver)}, nil
+		return nil, fmt.Errorf("неизвестный способ завершения")
 	})
 
 	s.handle(mux, "/api/templates/save", func(r *http.Request, b map[string]any) (any, error) {
@@ -557,13 +576,6 @@ func (s *Server) Routes(mux *http.ServeMux) {
 
 	s.handle(mux, "/api/run", func(r *http.Request, b map[string]any) (any, error) {
 		return s.mgr.Status(s.id(r, b)), nil
-	})
-	s.handle(mux, "/api/run/start", func(r *http.Request, b map[string]any) (any, error) {
-		return map[string]any{"ok": true}, s.mgr.Start(s.id(r, b))
-	})
-	s.handle(mux, "/api/run/stop", func(r *http.Request, b map[string]any) (any, error) {
-		s.mgr.Stop(s.id(r, b), true)
-		return map[string]any{"ok": true}, nil
 	})
 	s.handle(mux, "/api/run/now", func(r *http.Request, b map[string]any) (any, error) {
 		s.mgr.Kick(s.id(r, b))

@@ -67,10 +67,10 @@ function renderProfile(full = true) {
   $('#demoNote').classList.toggle('hidden', !p.demo);
   $('#keyNote').classList.toggle('hidden', p.demo || (p.client_id && p.api_key_set));
   $('#testNote').classList.toggle('hidden', p.live);
-  $('#liveNote').classList.toggle('hidden', !p.live);
+  $('#whNote').classList.toggle('hidden', !!p.warehouse_id);
   $('#demoBtns').classList.toggle('hidden', !p.demo);
-  $('#testReset').classList.toggle('hidden', p.live);
-  $$('#modeSeg input').forEach(i => i.checked = (i.value === 'live') === p.live);
+  $('#whName').textContent = p.warehouse_id ? '· склад ' + (p.warehouse_name || p.warehouse_id) : '';
+  $('#pTest').checked = !p.live;
   if (!full) return;
   const ws = $('#whSel');
   if (!ws.options.length || ws.dataset.shop !== p.id) {
@@ -87,11 +87,11 @@ function renderProfile(full = true) {
 
 function renderShops() {
   $('#sShops').innerHTML = S.shops.map(s => `<div class="shoprow">
-    <span class="dot ${s.running ? 'on' : ''} ${s.running && !s.live ? 'test' : ''}"></span>
+    <span class="dot ${s.running ? 'on' : ''} ${s.running && s.paused ? 'pause' : s.running && !s.live ? 'test' : ''}"></span>
     <span class="n">${esc(s.name)}</span>
     ${s.demo ? '<span class="chip">демо</span>' : ''}
-    <span class="chip ${s.live ? 'err' : ''}">${s.live ? 'боевой' : 'тест'}</span>
-    <span class="muted small">${s.running ? 'автоматизация работает' : 'остановлена'}</span>
+    ${s.live ? '' : '<span class="chip">тест</span>'}
+    <span class="muted small">${s.running ? (s.paused ? 'очередь на паузе' : 'очередь идёт') : 'очередь не идёт'}</span>
     <span class="a">${s.id === S.active ? '<span class="chip next">выбран</span>' : `<button class="btn ghost sm" data-sel="${s.id}">Выбрать</button>`}
     <button class="btn danger sm" data-del="${s.id}">Удалить</button></span></div>`).join('');
 }
@@ -137,8 +137,10 @@ function renderBatches() {
       ? `<span class="chip ok">продаётся (заранее)</span> продано <b>${b.sold}</b> из ${b.qty}<div class="muted small">выставлена, пока распродаётся текущая · в работе ${b.in_work}${stock(b.sku1)}</div>`
       : b.state === 'active'
       ? `<span class="chip next">продаётся</span> продано <b>${b.sold}</b> из ${b.qty}<div class="bar"><i style="width:${pct}%"></i></div><div class="muted small">в работе ${b.in_work}, доставлено ${b.delivered}${stock(b.sku1)}</div>`
+      : b.state === 'skipped'
+      ? '<span class="chip">не начата</span><div class="muted small">очередь закончили раньше</div>'
       : `<span class="chip ${b.in_work ? 'warn' : 'ok'}">${b.in_work ? 'доставляется' : 'завершена'}</span> продано ${b.sold} из ${b.qty}<div class="muted small">в работе ${b.in_work}, доставлено ${b.delivered}</div>`;
-    const act = b.state === 'done' && !b.in_work ? `<button class="btn ghost sm" data-rm="${b.id}" title="Убрать из списка. Её заказы всё равно будут доведены до конца.">Убрать</button>` : '';
+    const act = (b.state === 'done' && !b.in_work) || b.state === 'skipped' ? `<button class="btn ghost sm" data-rm="${b.id}" title="Убрать из списка. Её заказы всё равно будут доведены до конца.">Убрать</button>` : '';
     return `<tr class="${b.state}" data-keep="${b.id}"><td class="bn">${n}</td><td>${b.sku1}${name(b.sku1)}</td><td>${b.sku2}${name(b.sku2)}</td><td class="r">${b.qty}</td><td>${st}</td><td class="r">${act}</td></tr>`;
   }).concat(queued.map((b, i) => {
     n++;
@@ -171,16 +173,6 @@ async function loadProducts() {
   renderBatches();
 }
 
-async function saveCfg() {
-  const ws = $('#whSel'), opt = ws.selectedOptions[0];
-  if (!ws.value) return toast('Выберите склад', true);
-  try {
-    await api('/api/profile/save', { id: S.profile.id, warehouse_id: ws.value, warehouse_name: opt ? opt.textContent.split(' · ')[0] : '' });
-    $('#cfgMsg').textContent = 'Сохранено'; setTimeout(() => $('#cfgMsg').textContent = '', 2500);
-    await loadState(); loadProducts();
-  } catch (e) { toast(e.message, true); }
-}
-
 async function saveBatches() {
   const keep = $$('#batchTable tr[data-keep]').map(tr => tr.dataset.keep);
   try {
@@ -194,7 +186,7 @@ async function saveBatches() {
 
 async function applyStock() {
   const p = S.profile, a = batchSource().find(b => b.state === 'active');
-  if (!a) return toast('Нет активной партии — запустите автоматизацию, она выставит остаток первой партии сама', true);
+  if (!a) return toast('Нет партии в продаже — начните очередь, программа выставит остаток первой партии сама', true);
   if (p.live && !(await confirmBox(`<h3>Выставить остаток заново?</h3><p>SKU ${a.sku1} и ${a.sku2} на складе «${esc(p.warehouse_name)}» будет выставлено по <b>${a.qty} шт.</b> Это изменит остатки в Ozon.</p>`, 'Выставить'))) return;
   try {
     const j = await api('/api/stock', { id: p.id, qty: a.qty });
@@ -203,25 +195,118 @@ async function applyStock() {
   } catch (e) { $('#stockMsg').innerHTML = `<div class="err">${esc(e.message)}</div>`; }
 }
 
-// ---------------- автоматизация ----------------
-async function setMode(live) {
-  const p = S.profile;
-  if (live && !(await confirmBox(`<h3>Включить боевой режим?</h3><p>Программа начнёт <b>по-настоящему</b> менять статусы целевых заказов в Ozon: «Собрать» → «Доставляется» → «Курьер в пути» → «Условно доставлен». Кнопка «Выставить остатки» тоже будет менять остатки.</p><p class="muted">Рекомендуем сначала проверить работу в тестовом режиме.</p>`, 'Включить'))) {
-    renderProfile(); return;
-  }
-  try { await api('/api/profile/save', { id: p.id, live }); await loadState(); refreshRun(); } catch (e) { toast(e.message, true); }
+// ---------------- очередь: Начать / Пауза / Закончить ----------------
+function choiceBox(html, choices) {
+  // choices: [{v, label, cls}] — кнопки выбора; «Отмена» → null
+  return new Promise(res => {
+    $('#modalBody').innerHTML = html + '<div class="modal-btns">' + choices.map((c, i) => `<button class="btn ${c.cls || 'primary'}" data-ch="${i}">${esc(c.label)}</button>`).join('') + '</div>';
+    $('#modalYes').classList.add('hidden');
+    $('#modal').classList.remove('hidden');
+    const done = v => { $('#modal').classList.add('hidden'); $('#modalYes').classList.remove('hidden'); $('#modalBody').onclick = $('#modalNo').onclick = null; res(v); };
+    $('#modalBody').onclick = e => { const i = e.target.dataset.ch; if (i !== undefined) done(choices[+i].v); };
+    $('#modalNo').onclick = () => done(null);
+  });
 }
 
-async function toggleRun() {
-  const p = S.profile;
+async function startQueue() {
+  const p = S.profile, tid = $('#tplSel').value;
+  if (!p.warehouse_id) return toast('Сначала выберите склад в «Настройках»', true);
+  if (queueEdit && !tid) { await saveBatches(); if (queueEdit) return; }
+  let html;
+  if (tid) {
+    const t = templates().find(x => x.id === tid);
+    html = `<h3>Начать очередь «${esc(t.name)}»?</h3><div class="modal-list">${t.rows.map((r, i) => `${i + 1}. SKU ${r.sku1} + ${r.sku2} — ${r.qty} шт.`).join('<br>')}</div>`;
+  } else {
+    const q = batchSource().filter(b => ['queued', 'active', 'next'].includes(b.state));
+    if (!q.length) return toast('В очереди нет партий — выберите сохранённую очередь или добавьте партии', true);
+    html = `<h3>Начать очередь из таблицы?</h3><div class="modal-list">${q.map(b => `${b.num}. SKU ${b.sku1} + ${b.sku2} — ${b.qty} шт.`).join('<br>')}</div>`;
+  }
+  html += p.live
+    ? '<p>Программа выставит остаток первой паре и начнёт проводить её заказы в Ozon.</p>'
+    : '<p class="muted">Тестовый режим: в Ozon ничего не изменится, действия будут только в журнале.</p>';
+  if (!(await confirmBox(html, 'Начать'))) return;
   try {
-    if (run && run.running) { await api('/api/run/stop', { id: p.id }); toast('Автоматизация остановлена'); }
-    else {
-      if (p.live && !(await confirmBox('<h3>Запустить в боевом режиме?</h3><p>Целевые заказы будут переводиться по статусам в Ozon автоматически.</p>', 'Запустить'))) return;
-      await api('/api/run/start', { id: p.id }); toast('Автоматизация запущена');
-    }
-    await loadState(); setTimeout(refreshRun, 400);
+    await api('/api/queue/start', { id: p.id, template_id: tid });
+    queueEdit = null; $('#tplSel').value = '';
+    toast('Очередь начата');
+    await loadState(); setTimeout(() => { refreshRun(); loadProducts(); }, 600);
   } catch (e) { toast(e.message, true); }
+}
+
+async function pauseQueue() {
+  const p = S.profile, paused = run && run.paused;
+  if (!paused) {
+    const on = batchSource().filter(b => b.state === 'active' || b.state === 'next');
+    const html = `<h3>Поставить очередь на паузу?</h3><p>Программа перестанет менять статусы заказов и <b>обнулит остаток</b> пар в продаже${p.live ? '' : ' (тест — только в журнале)'}, чтобы не приходили новые заказы:</p>
+      <div class="modal-list">${on.map(b => `SKU ${b.sku1} + ${b.sku2}`).join('<br>') || 'пар в продаже нет'}</div>
+      <p class="muted">При «Продолжить» остаток вернётся: сколько осталось продать в партии. Пока пауза, заказы в работе ждут — следите за окнами доставки.</p>`;
+    if (!(await confirmBox(html, 'Пауза'))) return;
+  }
+  try {
+    await api('/api/queue/pause', { id: p.id, paused: !paused });
+    toast(paused ? 'Очередь продолжена' : 'Очередь на паузе');
+    await loadState(); setTimeout(refreshRun, 800);
+  } catch (e) { toast(e.message, true); }
+}
+
+async function finishQueue() {
+  let info;
+  try { info = await api('/api/queue/finish-preview?id=' + S.profile.id); } catch (er) { return toast(er.message, true); }
+  const pair = b => `SKU ${b.sku1} + ${b.sku2}`;
+  const finishing = run && run.finishing;
+  let html = finishing ? '<h3>Бросить оставшиеся заказы?</h3><p>Очередь уже заканчивается: программа доводит оставшиеся заказы. Можно бросить их и остановиться сейчас.</p>'
+    : '<h3>Закончить очередь?</h3><p>Новые партии запускаться не будут.</p>';
+  if (!finishing && info.on_sale && info.on_sale.length) {
+    html += info.zero
+      ? `<p><b>Будет обнулён остаток в Ozon</b>${info.live ? '' : ' (тестовый режим — только в журнале)'}:<br>${info.on_sale.map(pair).join('<br>')}</p>`
+      : `<p>Остаток пар в продаже <b>не обнуляется</b> (так в настройках):<br>${info.on_sale.map(pair).join('<br>')}</p>`;
+  }
+  const u = info.undelivered || [];
+  if (u.length) {
+    html += `<div class="banner err"><b>Внимание: эти заказы не доставлены (${u.length})</b><br>«Доставить оставшиеся» — программа доведёт их до «Условно доставлен» и остановится сама. «Бросить сейчас» — статусы больше меняться не будут, переведите их вручную в кабинете Ozon.</div>
+      <div class="modal-list">${u.slice(0, 50).map(x => `<div><b>${esc(x.posting_number)}</b> — ${esc(x.stage)}${x.window_end && !x.window_end.startsWith('0001') ? ', окно до ' + fmt(x.window_end, true) : ''}</div>`).join('')}${u.length > 50 ? `<div class="muted">и ещё ${u.length - 50}</div>` : ''}</div>`;
+  } else {
+    html += '<p class="muted">Недоставленных заказов в работе нет.</p>';
+  }
+  const choices = [];
+  if (!finishing) choices.push({ v: 'deliver', label: u.length ? `Доставить оставшиеся (${u.length}) и закончить` : 'Закончить', cls: 'primary' });
+  if (finishing || u.length) choices.push({ v: 'abandon', label: u.length ? `Бросить сейчас (${u.length} не доставлены)` : 'Остановить сейчас', cls: 'danger' });
+  const mode = await choiceBox(html, choices);
+  if (!mode) return;
+  try {
+    const j = await api('/api/queue/finish', { id: S.profile.id, mode });
+    if (j.warning) toast(j.warning, true);
+    else toast(mode === 'deliver' ? 'Очередь заканчивается: доставляю оставшиеся заказы' : 'Очередь закончена, программа остановлена');
+    await loadState(); await refreshRun(); refreshLog(); loadProducts();
+  } catch (er) { toast(er.message, true); }
+}
+
+function renderQueueBar() {
+  const on = run && run.running, st = $('#qState');
+  $('#qIdle').classList.toggle('hidden', !!on);
+  $('#qRun').classList.toggle('hidden', !on);
+  $('#batchNext').classList.toggle('hidden', !on || run.finishing);
+  $('#batchAdd').classList.toggle('hidden', !!(on && run.finishing));
+  $('#tplRunBox').classList.toggle('hidden', !on || run.finishing || !templates().length);
+  $('#stockApply').classList.toggle('hidden', !on || run.finishing || run.paused);
+  $('#pollNow').classList.toggle('hidden', !on);
+  $('#runDot').className = 'dot' + (on ? ' on' : '') + (on && run.paused ? ' pause' : on && !S.profile.live ? ' test' : '');
+  if (!on) { $('#runInfo').innerHTML = 'Очередь не идёт. Выберите сохранённую очередь (или соберите партии в таблице ниже) и нажмите «Начать».'; return; }
+  const name = run.queue_name ? ` «${esc(run.queue_name)}»` : '';
+  const inWork = ((run.postings) || []).filter(v => !v.final).length;
+  if (run.finishing) {
+    st.className = 'qstate fin'; st.innerHTML = `Очередь${name} заканчивается: доставляю ${inWork} заказ(ов)`;
+  } else if (run.paused) {
+    st.className = 'qstate pause'; st.innerHTML = `⏸ Очередь${name} на паузе${run.stock_off ? ' · остаток обнулён' : ' · обнуляю остаток…'}`;
+  } else {
+    st.className = 'qstate run'; st.innerHTML = `● Очередь${name} идёт${run.stock_off ? ' · возвращаю остаток…' : ''}`;
+  }
+  $('#qPause').textContent = run.paused ? '▶ Продолжить' : '⏸ Пауза';
+  $('#qPause').className = 'btn lg ' + (run.paused ? 'primary' : 'soft') + (run.finishing ? ' hidden' : '');
+  $('#qFinish').textContent = run.finishing ? 'Бросить сейчас' : '■ Закончить';
+  let info = `Работает с ${fmt(run.started, true)} · последняя проверка ${fmt(run.last_poll)} · следующая ${rel(run.next_poll)}`;
+  if (run.last_error) info += `<div class="e">Ошибка: ${esc(run.last_error)}</div>`;
+  $('#runInfo').innerHTML = info;
 }
 
 function stepCell(v, i) {
@@ -244,20 +329,15 @@ function renderRun() {
   const key = actB ? actB.id + ':' + actB.sold : '';
   if (key !== lastActive) { lastActive = key; if (run && run.running) loadProducts(); }
   renderBatches();
-  const btn = $('#runBtn'), on = run && run.running;
-  btn.textContent = on ? 'Остановить' : 'Запустить';
-  btn.className = 'btn lg ' + (on ? 'stop' : 'primary');
-  $('#runDot').className = 'dot' + (on ? ' on' : '') + (on && !p.live ? ' test' : '');
-  let info = on ? `Работает с ${fmt(run.started, true)} · последняя проверка ${fmt(run.last_poll)} · следующая ${rel(run.next_poll)}` : 'Остановлена';
-  if (on && run.last_error) info += `<div class="e">Ошибка: ${esc(run.last_error)}</div>`;
-  $('#runInfo').innerHTML = info;
+  renderQueueBar();
+  const on = run && run.running;
 
   const rows = (run && run.postings) || [];
   $('#ordersEmpty').classList.toggle('hidden', rows.length > 0);
   const act = rows.filter(v => !v.final).length;
   $('#ordersCount').textContent = rows.length ? `· в работе ${act}, завершено ${rows.length - act}` : '';
   $('#ordersTable').closest('.tablebox').classList.toggle('hidden', rows.length === 0);
-  $('#ordersEmpty').textContent = on ? 'Пока нет целевых заказов.' : 'Запустите автоматизацию, чтобы увидеть заказы.';
+  $('#ordersEmpty').textContent = on ? 'Пока нет целевых заказов.' : 'Заказы появятся, когда очередь начнётся.';
   $('#ordersTable tbody').innerHTML = rows.map(v => {
     let now;
     if (v.final) now = `<span class="chip ${v.final.includes('доставлен') ? 'ok' : 'warn'}">${esc(v.final)}</span>`;
@@ -313,12 +393,11 @@ $$('.tabs button').forEach(b => b.onclick = () => {
 $('#shopSel').onchange = async e => { await api('/api/profile/select', { id: e.target.value }); run = null; queueEdit = null; tplEdit = {}; await loadState(); refreshRun(); refreshLog(); loadProducts(); };
 $('#quitBtn').onclick = async () => {
   const anyRun = S.shops.some(s => s.running);
-  if (!(await confirmBox(`<h3>Закрыть программу?</h3>${anyRun ? '<p>Автоматизация будет приостановлена до следующего запуска программы. Пока программа закрыта, статусы заказов не меняются.</p>' : ''}`, 'Закрыть'))) return;
+  if (!(await confirmBox(`<h3>Закрыть программу?</h3>${anyRun ? '<p>Очередь продолжится при следующем запуске программы. Пока программа закрыта, статусы заказов не меняются.</p>' : ''}`, 'Закрыть'))) return;
   await api('/api/quit', {}).catch(() => { });
   document.body.innerHTML = '<main><div class="card" style="margin-top:40px"><h2>Программа закрыта</h2><p class="muted">Эту вкладку можно закрыть.</p></div></main>';
 };
 $('#whReload').onclick = e => { e.preventDefault(); loadWarehouses(); };
-$('#cfgSave').onclick = saveCfg;
 $('#stockApply').onclick = applyStock;
 $('#batchSave').onclick = saveBatches;
 $('#batchAdd').onclick = () => {
@@ -356,8 +435,15 @@ $('#batchNext').onclick = async () => {
   try { await api('/api/batches/next', { id: S.profile.id }); toast('Переключаю…'); setTimeout(refreshRun, 1500); } catch (er) { toast(er.message, true); }
 };
 
-$$('#modeSeg input').forEach(i => i.onchange = () => setMode(i.value === 'live'));
-$('#runBtn').onclick = toggleRun;
+$('#qStart').onclick = startQueue;
+$('#qPause').onclick = pauseQueue;
+$('#qFinish').onclick = finishQueue;
+$('#pTest').onchange = async e => {
+  const test = e.target.checked;
+  if (!test && !(await confirmBox('<h3>Выключить тестовый режим?</h3><p>Программа будет <b>по-настоящему</b> менять статусы заказов и остатки в Ozon.</p>', 'Выключить'))) { e.target.checked = true; return; }
+  try { await api('/api/profile/save', { id: S.profile.id, live: !test }); toast(test ? 'Тестовый режим включён' : 'Тестовый режим выключен'); await loadState(); refreshRun(); }
+  catch (er) { e.target.checked = !test; toast(er.message, true); }
+};
 $('#pollNow').onclick = async () => { await api('/api/run/now', { id: S.profile.id }); setTimeout(refreshRun, 1500); };
 $('#testReset').onclick = async () => {
   if (!(await confirmBox('<h3>Сбросить тестовый прогон?</h3><p>Программа забудет симулированные шаги и начнёт тест с текущих статусов Ozon.</p>', 'Сбросить'))) return;
@@ -370,8 +456,10 @@ $$('#logFilter input').forEach(i => i.onchange = renderLog);
 
 $('#sSave').onclick = async () => {
   const body = { id: S.profile.id, name: $('#sName').value, client_id: $('#sClient').value };
+  const ws = $('#whSel'), opt = ws.selectedOptions[0];
+  if (ws.value && ws.value != S.profile.warehouse_id) { body.warehouse_id = ws.value; body.warehouse_name = opt ? opt.textContent.split(' · ')[0] : ''; }
   if ($('#sKey').value.trim()) body.api_key = $('#sKey').value.trim();
-  try { await api('/api/profile/save', body); $('#sMsg').textContent = 'Сохранено'; await loadState(); } catch (e) { toast(e.message, true); }
+  try { await api('/api/profile/save', body); $('#sMsg').textContent = 'Сохранено'; await loadState(); loadProducts(); } catch (e) { toast(e.message, true); }
 };
 $('#sCheck').onclick = async () => {
   $('#sMsg').textContent = 'Проверяю…';
@@ -429,9 +517,7 @@ function templates() { return (S.profile && S.profile.templates) || []; }
 
 function renderTplSelect() {
   const sel = $('#tplSel'), cur = sel.value, list = templates();
-  sel.innerHTML = list.length
-    ? '<option value="">— выберите сохранённую очередь —</option>' + list.map(t => `<option value="${t.id}">${esc(t.name)} · пар: ${t.rows.length}</option>`).join('')
-    : '<option value="">Сохранённых очередей нет — создайте в «Настройках»</option>';
+  sel.innerHTML = '<option value="">— партии из таблицы ниже —</option>' + list.map(t => `<option value="${t.id}">${esc(t.name)} · пар: ${t.rows.length}</option>`).join('');
   if (list.some(t => t.id === cur)) sel.value = cur;
 }
 
@@ -514,8 +600,9 @@ $('#tplList').addEventListener('click', async e => {
 });
 
 $('#tplLoad').onclick = async () => {
-  const tid = $('#tplSel').value;
-  if (!tid) return toast('Выберите сохранённую очередь', true);
+  const names = templates().map(t => `<option value="${t.id}">${esc(t.name)} · пар: ${t.rows.length}</option>`).join('');
+  const tid = await choiceTpl(names);
+  if (!tid) return;
   const t = templates().find(x => x.id === tid);
   const queued = (queueEdit || batchSource().filter(b => b.state === 'queued')).length;
   const pairs = t.rows.map((r, i) => `${i + 1}. SKU ${r.sku1} + ${r.sku2} — ${r.qty} шт.`).join('<br>');
@@ -546,31 +633,16 @@ $('#tplSaveAs').onclick = async () => {
   } catch (er) { toast(er.message, true); }
 };
 
-$('#queueReset').onclick = async () => {
-  let info;
-  try { info = await api('/api/batches/reset-preview?id=' + S.profile.id); } catch (er) { return toast(er.message, true); }
-  const pair = b => `SKU ${b.sku1} + ${b.sku2}`;
-  let html = `<h3>Сбросить очередь?</h3><p>Все партии будут удалены из списка, автоматизация <b>выключится</b>. Чтобы снова начать работу, загрузите или добавьте очередь и нажмите «Запустить».</p>`;
-  if (info.on_sale && info.on_sale.length) {
-    html += info.zero
-      ? `<p><b>Будет обнулён остаток в Ozon</b>${info.live ? '' : ' (тестовый режим — только в журнале)'}:<br>${info.on_sale.map(pair).join('<br>')}</p>`
-      : `<p>Остаток пар в продаже <b>не обнуляется</b> (отключено в настройках) — покупатели смогут их заказывать, но программа эти заказы обрабатывать не будет:<br>${info.on_sale.map(pair).join('<br>')}</p>`;
-  }
-  const u = info.undelivered || [];
-  if (u.length) {
-    html += `<div class="banner err"><b>Внимание: эти заказы не доставлены (${u.length})!</b><br>Программа их бросит — статусы больше меняться не будут. Переведите их вручную в кабинете Ozon.</div>
-      <div class="modal-list">${u.slice(0, 50).map(x => `<div><b>${esc(x.posting_number)}</b> — ${esc(x.stage)}${x.window_end && !x.window_end.startsWith('0001') ? ', окно до ' + fmt(x.window_end, true) : ''}</div>`).join('')}${u.length > 50 ? `<div class="muted">и ещё ${u.length - 50}</div>` : ''}</div>`;
-  } else {
-    html += '<p class="muted">Недоставленных заказов в работе нет.</p>';
-  }
-  if (!(await confirmBox(html, u.length ? 'Сбросить и бросить заказы' : 'Сбросить', true))) return;
-  try {
-    const j = await api('/api/batches/reset', { id: S.profile.id });
-    queueEdit = null;
-    if (j.warning) toast(j.warning, true); else toast('Очередь сброшена, автоматизация выключена');
-    await loadState(); await refreshRun(); refreshLog(); loadProducts();
-  } catch (er) { toast(er.message, true); }
-};
+function choiceTpl(options) {
+  return new Promise(res => {
+    $('#modalBody').innerHTML = `<h3>Заменить очередь</h3><p>Партии «в очереди» будут заменены партиями выбранной сохранённой очереди. Партии в продаже не изменятся.</p><select id="tplPick" class="full">${options}</select>`;
+    $('#modalYes').textContent = 'Дальше'; $('#modalYes').className = 'btn primary';
+    $('#modal').classList.remove('hidden');
+    const done = v => { $('#modal').classList.add('hidden'); $('#modalYes').onclick = $('#modalNo').onclick = null; res(v); };
+    $('#modalYes').onclick = () => done($('#tplPick').value);
+    $('#modalNo').onclick = () => done(null);
+  });
+}
 
 $('#dOpen').onclick = () => api('/api/open-dir', {});
 

@@ -32,12 +32,16 @@ type Profile struct {
 	SKU2         int64           `json:"sku2,omitempty"`
 	StockQty     int             `json:"stock_qty,omitempty"`
 
-	Live         bool `json:"live"`          // false — тестовый режим
-	PauseSec     int  `json:"pause_sec"`     // пауза между шагами
-	MarginMin    int  `json:"margin_min"`    // запас до конца окна доставки
-	PollSec      int  `json:"poll_sec"`      // как часто опрашивать Ozon
-	LookbackDays int  `json:"lookback_days"` // за сколько дней смотреть заказы
-	Running      bool `json:"running"`       // автоматизация включена (восстанавливается после перезапуска)
+	Live         bool   `json:"live"`                 // false — тестовый режим
+	PauseSec     int    `json:"pause_sec"`            // пауза между шагами
+	MarginMin    int    `json:"margin_min"`           // запас до конца окна доставки
+	PollSec      int    `json:"poll_sec"`             // как часто опрашивать Ozon
+	LookbackDays int    `json:"lookback_days"`        // за сколько дней смотреть заказы
+	Running      bool   `json:"running"`              // очередь идёт (восстанавливается после перезапуска)
+	Paused       bool   `json:"paused"`               // очередь на паузе: статусы не меняются, остаток пар в продаже обнулён
+	Finishing    bool   `json:"finishing"`            // «Закончить»: новые партии не запускаются, оставшиеся заказы доводятся до конца
+	StockOff     bool   `json:"stock_off"`            // остаток пар в продаже обнулён на время паузы (при «Продолжить» вернуть)
+	QueueName    string `json:"queue_name,omitempty"` // имя сохранённой очереди, с которой начали
 }
 
 // QueueTemplate — сохранённая очередь: имя и пары SKU с количеством.
@@ -55,10 +59,11 @@ type TplRow struct {
 
 // Состояния партии.
 const (
-	BatchQueued = "queued" // в очереди
-	BatchActive = "active" // продаётся сейчас (основная)
-	BatchNext   = "next"   // следующая, выставлена заранее, пока основная распродаётся
-	BatchDone   = "done"   // распродана или переключена: заказы доводятся до конца, новые не ждём
+	BatchQueued = "queued"  // в очереди
+	BatchActive = "active"  // продаётся сейчас (основная)
+	BatchNext   = "next"    // следующая, выставлена заранее, пока основная распродаётся
+	BatchDone   = "done"    // распродана или переключена: заказы доводятся до конца, новые не ждём
+	BatchSkip   = "skipped" // очередь закончили раньше — партия так и не начиналась
 )
 
 type Batch struct {
@@ -71,6 +76,7 @@ type Batch struct {
 	StartedAt  time.Time `json:"started_at"`
 	FinishedAt time.Time `json:"finished_at"`
 	ZeroDone   bool      `json:"zero_done,omitempty"` // остаток обнулён после завершения
+	Keep       bool      `json:"keep,omitempty"`      // остаток после завершения не обнулять (так настроено)
 }
 
 func (b *Batch) Matches(a, c int64) bool {
@@ -220,7 +226,7 @@ func LoadStore(dir string) *Store {
 }
 
 func newProfile(name string) *Profile {
-	p := &Profile{ID: newID(), Name: name, MarginMin: 3}
+	p := &Profile{ID: newID(), Name: name, MarginMin: 3, Live: true} // обычная работа; тестовый режим — в настройках
 	p.normalize()
 	return p
 }

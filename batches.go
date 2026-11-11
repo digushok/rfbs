@@ -25,8 +25,9 @@ func (w *Worker) loadBatches() {
 	if w.store != nil {
 		if p, ok := w.store.Get(w.prof.ID); ok {
 			base = p.Batches
-			w.prof.KeepOldStock = p.KeepOldStock
+			w.prof.KeepOldStock, w.prof.KeepOnReset = p.KeepOldStock, p.KeepOnReset
 			w.prof.PrestockLeft = p.PrestockLeft
+			w.prof.Paused, w.prof.Finishing, w.prof.StockOff = p.Paused, p.Finishing, p.StockOff
 		}
 	} else {
 		base = w.prof.Batches
@@ -36,7 +37,7 @@ func (w *Worker) loadBatches() {
 	if !w.prof.Live {
 		for i := range bt {
 			if s, ok := w.sim[bt[i].ID]; ok {
-				bt[i].State, bt[i].Sold, bt[i].StartedAt, bt[i].FinishedAt, bt[i].ZeroDone = s.State, s.Sold, s.StartedAt, s.FinishedAt, s.ZeroDone
+				bt[i].State, bt[i].Sold, bt[i].StartedAt, bt[i].FinishedAt, bt[i].ZeroDone, bt[i].Keep = s.State, s.Sold, s.StartedAt, s.FinishedAt, s.ZeroDone, s.Keep
 			}
 		}
 	}
@@ -85,7 +86,7 @@ func (w *Worker) flushBatches() {
 		for i := range list {
 			if b, ok := changed[list[i].ID]; ok {
 				// Только состояние: SKU и количество в очереди пользователь мог поменять.
-				list[i].State, list[i].Sold, list[i].StartedAt, list[i].FinishedAt, list[i].ZeroDone = b.State, b.Sold, b.StartedAt, b.FinishedAt, b.ZeroDone
+				list[i].State, list[i].Sold, list[i].StartedAt, list[i].FinishedAt, list[i].ZeroDone, list[i].Keep = b.State, b.Sold, b.StartedAt, b.FinishedAt, b.ZeroDone, b.Keep
 			}
 		}
 	}
@@ -142,11 +143,27 @@ func (w *Worker) manageBatches(ctx context.Context, now time.Time) {
 		} else {
 			w.log.Add("ok", "%s распродана: %d из %d. Её заказы будут доведены до «Условно доставлен».", batchName(n, active), active.Sold, active.Qty)
 		}
-		active.State, active.FinishedAt = BatchDone, now
+		active.State, active.FinishedAt, active.Keep = BatchDone, now, w.prof.KeepOldStock
 		w.btDirty[active.ID] = true
 		active = nil
 	} else if manual && active == nil {
 		w.log.Add("info", "Нет активной партии — запускаю следующую из очереди.")
+	}
+	// «Закончить»: пары в продаже завершаются, очередь дальше не идёт.
+	if w.prof.Finishing {
+		for i := range w.bt {
+			b := &w.bt[i]
+			switch b.State {
+			case BatchActive, BatchNext:
+				b.State, b.FinishedAt, b.Keep = BatchDone, now, w.prof.KeepOnReset
+				w.btDirty[b.ID] = true
+				w.log.Add("info", "%s завершена: очередь заканчивается (продано %d из %d).", batchName(i+1, b), b.Sold, b.Qty)
+			case BatchQueued:
+				b.State = BatchSkip
+				w.btDirty[b.ID] = true
+			}
+		}
+		active, early = nil, nil
 	}
 
 	// 2. Обнуляем остаток завершённых партий (если включено).
@@ -155,7 +172,7 @@ func (w *Worker) manageBatches(ctx context.Context, now time.Time) {
 		if b.State != BatchDone || b.ZeroDone {
 			continue
 		}
-		if w.prof.KeepOldStock {
+		if b.Keep {
 			b.ZeroDone = true
 			w.btDirty[b.ID] = true
 			continue
@@ -168,6 +185,9 @@ func (w *Worker) manageBatches(ctx context.Context, now time.Time) {
 		w.btDirty[b.ID] = true
 	}
 
+	if w.prof.Finishing {
+		return
+	}
 	// 3. Нет основной партии: следующая, выставленная заранее, становится основной.
 	if active == nil && early != nil {
 		early.State = BatchActive
@@ -194,9 +214,9 @@ func (w *Worker) manageBatches(ctx context.Context, now time.Time) {
 		}
 	}
 	if next == nil {
-		if len(w.bt) > 0 {
+		if len(w.bt) > 0 && active != nil {
 			last := w.bt[len(w.bt)-1].ID
-			w.logOnce("noqueue|"+last, "warn", "Партии в очереди закончились — добавьте следующую пару SKU. Заказы начатых партий продолжают обрабатываться.")
+			w.logOnce("noqueue|"+last, "info", "Это последняя партия очереди. Когда она распродастся и заказы будут доставлены, очередь завершится.")
 		}
 		return
 	}
@@ -258,8 +278,13 @@ func (w *Worker) setPairStock(ctx context.Context, b *Batch, qty int) error {
 		w.log.Add("test", "[ТЕСТ] Выставил бы остаток %d шт. для SKU %d и %d на складе %d. В Ozon ничего не отправлено.", qty, b.SKU1, b.SKU2, w.prof.WarehouseID)
 		return nil
 	}
+	return w.setSKUStock(ctx, []int64{b.SKU1, b.SKU2}, qty)
+}
+
+// setSKUStock выставляет остаток каждому SKU из списка (только боевой режим).
+func (w *Worker) setSKUStock(ctx context.Context, skus []int64, qty int) error {
 	var missing []int64
-	for _, sku := range []int64{b.SKU1, b.SKU2} {
+	for _, sku := range skus {
 		if w.productInfo[sku] == nil {
 			missing = append(missing, sku)
 		}
@@ -274,7 +299,7 @@ func (w *Worker) setPairStock(ctx context.Context, b *Batch, qty int) error {
 		}
 	}
 	var errs []string
-	for _, sku := range []int64{b.SKU1, b.SKU2} {
+	for _, sku := range skus {
 		pi := w.productInfo[sku]
 		if pi == nil {
 			errs = append(errs, fmt.Sprintf("товар с SKU %d не найден в магазине", sku))
@@ -310,4 +335,165 @@ func (w *Worker) batchViews() []BatchView {
 		out[i] = BatchView{Batch: b, Num: i + 1, InWork: inWork[b.ID], Delivered: delivered[b.ID]}
 	}
 	return out
+}
+
+// ---------- пауза, проверка остатков, завершение очереди ----------
+
+const stockCheckEvery = 10 * time.Minute
+
+func (w *Worker) onSale() []*Batch {
+	var out []*Batch
+	for i := range w.bt {
+		if s := w.bt[i].State; s == BatchActive || s == BatchNext {
+			out = append(out, &w.bt[i])
+		}
+	}
+	return out
+}
+
+func (w *Worker) setStockOff(v bool) {
+	w.prof.StockOff = v
+	if w.store != nil {
+		w.store.Update(w.prof.ID, func(p *Profile) { p.StockOff = v })
+	}
+}
+
+// pauseStock: на паузе обнуляет остаток пар в продаже, после «Продолжить» возвращает оставшееся количество.
+// Возвращает true, если остаток сейчас в обычном состоянии (можно управлять партиями).
+func (w *Worker) pauseStock(ctx context.Context) bool {
+	switch {
+	case w.prof.Paused && !w.prof.StockOff:
+		var errs []string
+		for _, b := range w.onSale() {
+			if err := w.setPairStock(ctx, b, 0); err != nil {
+				errs = append(errs, fmt.Sprintf("SKU %d + %d: %v", b.SKU1, b.SKU2, err))
+			}
+		}
+		if len(errs) > 0 {
+			w.logOnce("pausezero|"+strings.Join(errs, ";"), "err", "Пауза: не удалось обнулить остаток (%s) — повторю.", strings.Join(errs, "; "))
+			return false
+		}
+		w.setStockOff(true)
+		w.log.Add("info", "Пауза: остаток пар в продаже обнулён, статусы заказов не меняются. Нажмите «Продолжить», чтобы вернуть остаток и продолжить.")
+		return false
+	case !w.prof.Paused && w.prof.StockOff:
+		var errs []string
+		for _, b := range w.onSale() {
+			q := b.Qty - b.Sold
+			if q < 0 {
+				q = 0
+			}
+			if err := w.setPairStock(ctx, b, q); err != nil {
+				errs = append(errs, fmt.Sprintf("SKU %d + %d: %v", b.SKU1, b.SKU2, err))
+			}
+		}
+		if len(errs) > 0 {
+			w.logOnce("pauserest|"+strings.Join(errs, ";"), "err", "Продолжение: не удалось вернуть остаток (%s) — повторю.", strings.Join(errs, "; "))
+			return false
+		}
+		w.setStockOff(false)
+		w.log.Add("ok", "Очередь продолжена: остаток пар в продаже возвращён (сколько осталось продать).")
+		return true
+	}
+	return !w.prof.Paused
+}
+
+// checkDoneStock раз в 10 минут проверяет остаток пар завершённых партий и обнуляет его, если он появился
+// (например, вернулся после отмены заказа).
+func (w *Worker) checkDoneStock(ctx context.Context, now time.Time) {
+	if now.Before(w.stockCheckAt) {
+		return
+	}
+	w.stockCheckAt = now.Add(stockCheckEvery)
+	busy := map[int64]bool{} // SKU, которые сейчас продаются или ещё будут продаваться
+	for _, b := range w.bt {
+		if b.State == BatchActive || b.State == BatchNext || b.State == BatchQueued {
+			busy[b.SKU1], busy[b.SKU2] = true, true
+		}
+	}
+	owner := map[int64]int{} // SKU → номер завершённой партии
+	var skus []int64
+	for i, b := range w.bt {
+		if b.State != BatchDone || b.Keep || !b.ZeroDone {
+			continue
+		}
+		for _, sku := range []int64{b.SKU1, b.SKU2} {
+			if _, ok := owner[sku]; !ok && !busy[sku] {
+				owner[sku] = i + 1
+				skus = append(skus, sku)
+			}
+		}
+	}
+	if len(skus) == 0 {
+		return
+	}
+	rows, err := w.client.StocksFBS(ctx, skus)
+	if err != nil {
+		w.logOnce("stockcheck|"+err.Error(), "err", "Проверка остатков завершённых пар: %v (повторю через 10 минут).", err)
+		return
+	}
+	var zero []int64
+	avail := map[int64]int64{}
+	for _, r := range rows {
+		if r.WarehouseID != w.prof.WarehouseID {
+			continue
+		}
+		if _, ok := owner[r.SKU]; !ok {
+			continue
+		}
+		if a := r.Present - r.Reserved; a > 0 {
+			if avail[r.SKU] == 0 {
+				zero = append(zero, r.SKU)
+			}
+			avail[r.SKU] += a
+		}
+	}
+	if !w.prof.Live {
+		for _, sku := range zero {
+			w.logOnce(fmt.Sprintf("tstockcheck|%d|%d", sku, avail[sku]), "test", "[ТЕСТ] Проверка остатков: у SKU %d (завершённая партия %d) на складе %d шт. Обнулил бы. В Ozon ничего не отправлено.", sku, owner[sku], avail[sku])
+		}
+		return
+	}
+	for _, sku := range zero {
+		w.log.Add("warn", "Проверка остатков: у SKU %d (завершённая партия %d) снова %d шт. в наличии — обнуляю.", sku, owner[sku], avail[sku])
+	}
+	if len(zero) > 0 {
+		if err := w.setSKUStock(ctx, zero, 0); err != nil {
+			w.log.Add("err", "Проверка остатков: не удалось обнулить: %v (повторю через минуту).", err)
+			w.stockCheckAt = now.Add(time.Minute)
+		}
+	}
+}
+
+// checkComplete: все партии завершены и все заказы доведены — очередь окончена, работа останавливается.
+func (w *Worker) checkComplete(now time.Time) bool {
+	if w.prof.Paused || len(w.bt) == 0 {
+		return false
+	}
+	for _, b := range w.bt {
+		switch {
+		case b.State == BatchSkip:
+		case b.State == BatchDone && b.ZeroDone:
+		default:
+			return false
+		}
+	}
+	for _, e := range w.journal.All() {
+		if e.Final == "" && !e.Abandoned && (e.Stage >= 0 || e.Batch != "") {
+			return false
+		}
+	}
+	if w.prof.Finishing {
+		w.log.Add("ok", "Очередь закончена: все оставшиеся заказы доставлены. Программа остановлена — выберите очередь и нажмите «Начать».")
+	} else {
+		w.log.Add("ok", "Очередь выполнена: все партии распроданы, заказы доставлены. Программа остановлена — выберите очередь и нажмите «Начать».")
+	}
+	if w.store != nil {
+		w.store.Update(w.prof.ID, func(p *Profile) { p.Running, p.Paused, p.Finishing, p.StockOff = false, false, false, false })
+	}
+	w.completed = true
+	if w.onDone != nil {
+		w.onDone()
+	}
+	return true
 }
