@@ -23,25 +23,28 @@ type Profile struct {
 	WarehouseID   int64  `json:"warehouse_id"`
 	WarehouseName string `json:"warehouse_name"`
 	// Партии — пары SKU по очереди. Старые поля SKU1/SKU2/StockQty — только для перехода с версий до 1.2.
-	Batches      []Batch         `json:"batches"`
-	KeepOldStock bool            `json:"keep_old_stock"` // false (по умолчанию) — обнулять остаток старой пары при переключении
-	PrestockLeft *int            `json:"prestock_left"`  // за сколько заказов до конца партии выставлять следующую (nil — 3)
-	KeepOnReset  bool            `json:"keep_on_reset"`  // false (по умолчанию) — при сбросе очереди обнулять остаток пар в продаже
-	Templates    []QueueTemplate `json:"templates"`      // сохранённые очереди
-	SKU1         int64           `json:"sku1,omitempty"`
-	SKU2         int64           `json:"sku2,omitempty"`
-	StockQty     int             `json:"stock_qty,omitempty"`
+	Batches       []Batch         `json:"batches"`
+	KeepOldStock  bool            `json:"keep_old_stock"`  // false (по умолчанию) — обнулять остаток старой пары при переключении
+	PrestockLeft  *int            `json:"prestock_left"`   // за сколько заказов до конца партии выставлять следующую (nil — 3)
+	KeepOnReset   bool            `json:"keep_on_reset"`   // false (по умолчанию) — при сбросе очереди обнулять остаток пар в продаже
+	Templates     []QueueTemplate `json:"templates"`       // сохранённые очереди
+	StockCheckMin int             `json:"stock_check_min"` // как часто проверять остаток завершённых пар, мин. (0 — 10)
+	CancelForeign bool            `json:"cancel_foreign"`  // отменять нецелевые заказы с SKU из очереди
+	SKU1          int64           `json:"sku1,omitempty"`
+	SKU2          int64           `json:"sku2,omitempty"`
+	StockQty      int             `json:"stock_qty,omitempty"`
 
-	Live         bool   `json:"live"`                 // false — тестовый режим
-	PauseSec     int    `json:"pause_sec"`            // пауза между шагами
-	MarginMin    int    `json:"margin_min"`           // запас до конца окна доставки
-	PollSec      int    `json:"poll_sec"`             // как часто опрашивать Ozon
-	LookbackDays int    `json:"lookback_days"`        // за сколько дней смотреть заказы
-	Running      bool   `json:"running"`              // очередь идёт (восстанавливается после перезапуска)
-	Paused       bool   `json:"paused"`               // очередь на паузе: статусы не меняются, остаток пар в продаже обнулён
-	Finishing    bool   `json:"finishing"`            // «Закончить»: новые партии не запускаются, оставшиеся заказы доводятся до конца
-	StockOff     bool   `json:"stock_off"`            // остаток пар в продаже обнулён на время паузы (при «Продолжить» вернуть)
-	QueueName    string `json:"queue_name,omitempty"` // имя сохранённой очереди, с которой начали
+	Live         bool      `json:"live"`                 // false — тестовый режим
+	PauseSec     int       `json:"pause_sec"`            // пауза между шагами
+	MarginMin    int       `json:"margin_min"`           // запас до конца окна доставки
+	PollSec      int       `json:"poll_sec"`             // как часто опрашивать Ozon
+	LookbackDays int       `json:"lookback_days"`        // за сколько дней смотреть заказы
+	Running      bool      `json:"running"`              // очередь идёт (восстанавливается после перезапуска)
+	Paused       bool      `json:"paused"`               // очередь на паузе: статусы не меняются, остаток пар в продаже обнулён
+	Finishing    bool      `json:"finishing"`            // «Закончить»: новые партии не запускаются, оставшиеся заказы доводятся до конца
+	StockOff     bool      `json:"stock_off"`            // остаток пар в продаже обнулён на время паузы (при «Продолжить» вернуть)
+	QueueName    string    `json:"queue_name,omitempty"` // имя сохранённой очереди, с которой начали
+	QueueStarted time.Time `json:"queue_started"`        // когда нажали «Начать»
 }
 
 // QueueTemplate — сохранённая очередь: имя и пары SKU с количеством.
@@ -145,6 +148,9 @@ func (p *Profile) normalize() {
 	}
 	if p.PollSec < 15 {
 		p.PollSec = 30
+	}
+	if p.StockCheckMin <= 0 {
+		p.StockCheckMin = 10
 	}
 	if p.LookbackDays <= 0 {
 		p.LookbackDays = 14
@@ -399,14 +405,28 @@ type Journal struct {
 	mu      sync.Mutex
 	dirty   bool
 	Entries map[string]*JEntry `json:"entries"`
+	Foreign map[string]*FEntry `json:"foreign,omitempty"` // нецелевые заказы, по которым программа что-то сделала
+}
+
+// FEntry — что программа сделала с нецелевым заказом (пополнение или отмена) — чтобы не повторять.
+type FEntry struct {
+	Action     string        `json:"action"` // replenished, cancelled
+	At         time.Time     `json:"at"`
+	Restore    map[int64]int `json:"restore,omitempty"` // после отмены: SKU (не из пар в продаже) → какой остаток вернуть
+	SKUs       []int64       `json:"skus,omitempty"`    // SKU заказа, остаток которых проверяется после отмены
+	VerifyAt   time.Time     `json:"verify_at,omitempty"`
+	VerifyLeft int           `json:"verify_left,omitempty"`
 }
 
 func LoadJournal(path string) *Journal {
-	j := &Journal{path: path, Entries: map[string]*JEntry{}}
+	j := &Journal{path: path, Entries: map[string]*JEntry{}, Foreign: map[string]*FEntry{}}
 	if b, err := os.ReadFile(path); err == nil {
 		json.Unmarshal(b, j)
 		if j.Entries == nil {
 			j.Entries = map[string]*JEntry{}
+		}
+		if j.Foreign == nil {
+			j.Foreign = map[string]*FEntry{}
 		}
 	}
 	return j
@@ -441,6 +461,30 @@ func (j *Journal) All() []*JEntry {
 	return out
 }
 
+// ForeignGet / ForeignSet — записи о нецелевых заказах (только из цикла работника).
+func (j *Journal) ForeignGet(pn string) *FEntry {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.Foreign[pn]
+}
+
+func (j *Journal) ForeignSet(pn string, f *FEntry) {
+	j.mu.Lock()
+	j.Foreign[pn] = f
+	j.dirty = true
+	j.mu.Unlock()
+}
+
+func (j *Journal) ForeignAll() map[string]*FEntry {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	out := make(map[string]*FEntry, len(j.Foreign))
+	for k, v := range j.Foreign {
+		out[k] = v
+	}
+	return out
+}
+
 func (j *Journal) MarkDirty() {
 	j.mu.Lock()
 	j.dirty = true
@@ -460,6 +504,11 @@ func (j *Journal) Save() error {
 			delete(j.Entries, k)
 		}
 	}
+	for k, f := range j.Foreign {
+		if now.Sub(f.At) > 7*24*time.Hour {
+			delete(j.Foreign, k)
+		}
+	}
 	b, _ := json.Marshal(j)
 	if err := writeFileAtomic(j.path, b); err != nil {
 		return err
@@ -471,6 +520,7 @@ func (j *Journal) Save() error {
 func (j *Journal) Reset() error {
 	j.mu.Lock()
 	j.Entries = map[string]*JEntry{}
+	j.Foreign = map[string]*FEntry{}
 	j.dirty = true
 	j.mu.Unlock()
 	return j.Save()

@@ -190,6 +190,12 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			if v, ok := b["keep_on_reset"].(bool); ok {
 				p.KeepOnReset = v
 			}
+			if v, ok := b["cancel_foreign"].(bool); ok {
+				p.CancelForeign = v
+			}
+			if v, ok := num(b, "stock_check_min"); ok && v > 0 {
+				p.StockCheckMin = int(v)
+			}
 			if v, ok := num(b, "prestock_left"); ok && v >= 0 {
 				n := int(v)
 				p.PrestockLeft = &n

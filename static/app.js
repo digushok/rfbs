@@ -81,6 +81,7 @@ function renderProfile(full = true) {
   $('#sKey').value = ''; $('#sKey').placeholder = p.api_key_set ? 'сохранён (введите новый, чтобы заменить)' : '';
   $('#sName').disabled = false; $('#sClient').disabled = $('#sKey').disabled = p.demo;
   $('#pPause').value = p.pause_sec; $('#pMargin').value = p.margin_min; $('#pPoll').value = p.poll_sec; $('#pLook').value = p.lookback_days;
+  $('#pStockCheck').value = p.stock_check_min || 10; $('#pCancel').checked = !!p.cancel_foreign;
   $('#pPrestock').value = p.prestock_left ?? 3; $('#pZeroOld').checked = !p.keep_old_stock; $('#pZeroReset').checked = !p.keep_on_reset;
   renderTemplates();
 }
@@ -471,9 +472,10 @@ $('#sCheck').onclick = async () => {
   } catch (e) { $('#sMsg').innerHTML = `<span class="chip err">${esc(e.message)}</span>`; }
 };
 $('#pSave').onclick = async () => {
+  if ($('#pCancel').checked && !S.profile.cancel_foreign && !(await confirmBox('<h3>Включить отмену нецелевых заказов?</h3><p>Программа будет <b>отменять</b> в Ozon заказы со SKU из очереди, которые не подходят под целевой состав (например, 2 шт. одного SKU), с причиной «Товар закончился на складе продавца». Отмены по вине продавца могут влиять на рейтинг магазина.</p>', 'Включить', true))) return;
   try {
     await api('/api/profile/save', { id: S.profile.id, pause_sec: $('#pPause').value, margin_min: $('#pMargin').value, poll_sec: $('#pPoll').value, lookback_days: $('#pLook').value,
-      prestock_left: $('#pPrestock').value, keep_old_stock: !$('#pZeroOld').checked, keep_on_reset: !$('#pZeroReset').checked });
+      prestock_left: $('#pPrestock').value, stock_check_min: $('#pStockCheck').value, cancel_foreign: $('#pCancel').checked, keep_old_stock: !$('#pZeroOld').checked, keep_on_reset: !$('#pZeroReset').checked });
     $('#pMsg').textContent = 'Сохранено'; setTimeout(() => $('#pMsg').textContent = '', 2500); await loadState();
   } catch (e) { toast(e.message, true); }
 };

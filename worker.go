@@ -176,9 +176,11 @@ type Worker struct {
 	activateAt  time.Time
 	productInfo map[int64]*ProductInfo
 
-	stockCheckAt time.Time // следующая проверка остатков завершённых пар
-	completed    bool      // очередь окончена — работник ждёт остановки
-	onDone       func()    // вызывается, когда очередь окончена
+	stockCheckAt      time.Time // следующая проверка остатков завершённых пар
+	completed         bool      // очередь окончена — работник ждёт остановки
+	cancelReason      int64
+	cancelReasonTitle string
+	onDone            func() // вызывается, когда очередь окончена
 }
 
 func NewWorker(prof Profile, client *Client, journal *Journal, log *ShopLog) *Worker {
@@ -396,6 +398,7 @@ func (w *Worker) Tick(ctx context.Context) time.Time {
 	w.loadBatches()
 	var skipped []SkipView
 	var pend []pendingAction
+	var foreign []*Posting
 	for _, p := range postings {
 		if ctx.Err() != nil {
 			return time.Time{}
@@ -421,6 +424,9 @@ func (w *Worker) Tick(ctx context.Context) time.Time {
 			}
 		}
 		if reason != "" {
+			if postingWarehouse(p) == w.prof.WarehouseID {
+				foreign = append(foreign, p)
+			}
 			if _, ok, final := realStage(p); ok && final == "" && len(skipped) < 300 {
 				skipped = append(skipped, SkipView{PostingNumber: p.PostingNumber, Status: p.Status, Reason: reason, Created: p.InProcessAt.Time, Products: productsText(p)})
 			}
@@ -436,10 +442,15 @@ func (w *Worker) Tick(ctx context.Context) time.Time {
 		w.execute(ctx, pend, now)
 		w.manageBatches(ctx, now)
 	}
-	w.checkDoneStock(ctx, now)
+	w.handleForeign(ctx, foreign, now)
+	w.verifyRestores(ctx, now)
+	for i := range skipped {
+		skipped[i].Reason += foreignNote(w.journal.ForeignGet(skipped[i].PostingNumber))
+	}
+	w.checkDoneStock(ctx, now, false)
 	w.flushBatches()
 	w.journal.Save()
-	if w.checkComplete(now) {
+	if w.checkComplete(ctx, now) {
 		w.flushBatches()
 		w.journal.Save()
 	}
@@ -1123,7 +1134,7 @@ func (m *Manager) StartQueue(id, tplID string) error {
 			lerr = fmt.Errorf("в очереди нет партий — выберите сохранённую очередь или добавьте партии")
 			return
 		}
-		p.Batches, p.QueueName = out, name
+		p.Batches, p.QueueName, p.QueueStarted = out, name, now
 		p.Paused, p.Finishing, p.StockOff = false, false, false
 	})
 	if err == nil {

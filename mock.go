@@ -46,6 +46,8 @@ type MockOzon struct {
 	Fail          map[string]bool // принудительная ошибка метода (для тестов)
 	BadPostings   map[string]bool // отправления, из-за которых Ozon отклоняет весь запрос (для тестов)
 	NoTransition  map[string]bool // отправления, которые Ozon не даёт перевести («invalid transition»)
+	Cancelled     []string        // отменённые продавцом
+	CancelReason  int64           // причина последней отмены
 	LastMileState [2]string       // статус/подстатус после «курьер в пути»
 	// Окно доставки демо-заказа относительно момента заказа.
 	WindowStart, WindowEnd time.Duration
@@ -283,6 +285,30 @@ func (m *MockOzon) Handle(path string, body []byte) (int, any) {
 			return errResp(404, "POSTING_NOT_FOUND")
 		}
 		return 200, map[string]any{"result": p}
+	case "/v2/posting/fbs/cancel-reason/list":
+		return 200, map[string]any{"result": []any{
+			map[string]any{"id": 358, "title": "Покупатель отменил заказ", "type_id": "buyer"},
+			map[string]any{"id": 352, "title": "Товар закончился на складе продавца", "type_id": "seller"},
+			map[string]any{"id": 401, "title": "Продавец отклонил арбитраж", "type_id": "seller"},
+		}}
+	case "/v2/posting/fbs/cancel":
+		pn, _ := req["posting_number"].(string)
+		p := m.find(pn)
+		if p == nil {
+			return errResp(404, "POSTING_NOT_FOUND")
+		}
+		if p.Status != "awaiting_packaging" && p.Status != "awaiting_deliver" {
+			return errResp(400, "POSTING_CANNOT_BE_CANCELLED: отправление в статусе "+p.Status)
+		}
+		m.Cancelled = append(m.Cancelled, pn)
+		m.CancelReason = toInt(req["cancel_reason_id"])
+		p.Status, p.Substatus = "cancelled", "posting_canceled"
+		if m.CancelReason == 352 { // как Ozon: «товар закончился» — остаток товаров заказа обнуляется
+			for _, x := range p.Products {
+				m.stock[x.SKU] = 0
+			}
+		}
+		return 200, map[string]any{"result": true}
 	case "/v4/posting/fbs/ship":
 		pn, _ := req["posting_number"].(string)
 		p := m.find(pn)

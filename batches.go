@@ -28,6 +28,7 @@ func (w *Worker) loadBatches() {
 			w.prof.KeepOldStock, w.prof.KeepOnReset = p.KeepOldStock, p.KeepOnReset
 			w.prof.PrestockLeft = p.PrestockLeft
 			w.prof.Paused, w.prof.Finishing, w.prof.StockOff = p.Paused, p.Finishing, p.StockOff
+			w.prof.CancelForeign, w.prof.StockCheckMin, w.prof.QueueStarted = p.CancelForeign, p.StockCheckMin, p.QueueStarted
 		}
 	} else {
 		base = w.prof.Batches
@@ -339,8 +340,6 @@ func (w *Worker) batchViews() []BatchView {
 
 // ---------- пауза, проверка остатков, завершение очереди ----------
 
-const stockCheckEvery = 10 * time.Minute
-
 func (w *Worker) onSale() []*Batch {
 	var out []*Batch
 	for i := range w.bt {
@@ -398,13 +397,18 @@ func (w *Worker) pauseStock(ctx context.Context) bool {
 	return !w.prof.Paused
 }
 
-// checkDoneStock раз в 10 минут проверяет остаток пар завершённых партий и обнуляет его, если он появился
-// (например, вернулся после отмены заказа).
-func (w *Worker) checkDoneStock(ctx context.Context, now time.Time) {
-	if now.Before(w.stockCheckAt) {
-		return
+// checkDoneStock раз в N минут (настройка, по умолчанию 10) проверяет остаток пар завершённых партий и обнуляет
+// его, если он появился (например, вернулся после отмены заказа). force — проверить сейчас (перед завершением очереди).
+// Возвращает false, если проверить или обнулить не удалось.
+func (w *Worker) checkDoneStock(ctx context.Context, now time.Time, force bool) bool {
+	if !force && now.Before(w.stockCheckAt) {
+		return true
 	}
-	w.stockCheckAt = now.Add(stockCheckEvery)
+	every := time.Duration(w.prof.StockCheckMin) * time.Minute
+	if every <= 0 {
+		every = 10 * time.Minute
+	}
+	w.stockCheckAt = now.Add(every)
 	busy := map[int64]bool{} // SKU, которые сейчас продаются или ещё будут продаваться
 	for _, b := range w.bt {
 		if b.State == BatchActive || b.State == BatchNext || b.State == BatchQueued {
@@ -425,12 +429,13 @@ func (w *Worker) checkDoneStock(ctx context.Context, now time.Time) {
 		}
 	}
 	if len(skus) == 0 {
-		return
+		return true
 	}
 	rows, err := w.client.StocksFBS(ctx, skus)
 	if err != nil {
-		w.logOnce("stockcheck|"+err.Error(), "err", "Проверка остатков завершённых пар: %v (повторю через 10 минут).", err)
-		return
+		w.logOnce("stockcheck|"+err.Error(), "err", "Проверка остатков завершённых пар: %v (повторю).", err)
+		w.stockCheckAt = now.Add(time.Minute)
+		return false
 	}
 	var zero []int64
 	avail := map[int64]int64{}
@@ -452,7 +457,7 @@ func (w *Worker) checkDoneStock(ctx context.Context, now time.Time) {
 		for _, sku := range zero {
 			w.logOnce(fmt.Sprintf("tstockcheck|%d|%d", sku, avail[sku]), "test", "[ТЕСТ] Проверка остатков: у SKU %d (завершённая партия %d) на складе %d шт. Обнулил бы. В Ozon ничего не отправлено.", sku, owner[sku], avail[sku])
 		}
-		return
+		return true
 	}
 	for _, sku := range zero {
 		w.log.Add("warn", "Проверка остатков: у SKU %d (завершённая партия %d) снова %d шт. в наличии — обнуляю.", sku, owner[sku], avail[sku])
@@ -461,12 +466,14 @@ func (w *Worker) checkDoneStock(ctx context.Context, now time.Time) {
 		if err := w.setSKUStock(ctx, zero, 0); err != nil {
 			w.log.Add("err", "Проверка остатков: не удалось обнулить: %v (повторю через минуту).", err)
 			w.stockCheckAt = now.Add(time.Minute)
+			return false
 		}
 	}
+	return true
 }
 
 // checkComplete: все партии завершены и все заказы доведены — очередь окончена, работа останавливается.
-func (w *Worker) checkComplete(now time.Time) bool {
+func (w *Worker) checkComplete(ctx context.Context, now time.Time) bool {
 	if w.prof.Paused || len(w.bt) == 0 {
 		return false
 	}
@@ -483,10 +490,14 @@ func (w *Worker) checkComplete(now time.Time) bool {
 			return false
 		}
 	}
+	// Последняя проверка остатков всех завершённых пар: без неё не останавливаемся.
+	if !w.checkDoneStock(ctx, now, true) {
+		return false
+	}
 	if w.prof.Finishing {
-		w.log.Add("ok", "Очередь закончена: все оставшиеся заказы доставлены. Программа остановлена — выберите очередь и нажмите «Начать».")
+		w.log.Add("ok", "Очередь закончена: все оставшиеся заказы доставлены, остатки пар очереди проверены. Программа остановлена — выберите очередь и нажмите «Начать».")
 	} else {
-		w.log.Add("ok", "Очередь выполнена: все партии распроданы, заказы доставлены. Программа остановлена — выберите очередь и нажмите «Начать».")
+		w.log.Add("ok", "Очередь выполнена: все партии распроданы, заказы доставлены, остатки пар очереди проверены. Программа остановлена — выберите очередь и нажмите «Начать».")
 	}
 	if w.store != nil {
 		w.store.Update(w.prof.ID, func(p *Profile) { p.Running, p.Paused, p.Finishing, p.StockOff = false, false, false, false })

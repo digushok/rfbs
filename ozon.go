@@ -26,6 +26,7 @@ var mutatingPaths = map[string]bool{
 	"/v2/fbs/posting/delivering": true,
 	"/v2/fbs/posting/last-mile":  true,
 	"/v2/fbs/posting/delivered":  true,
+	"/v2/posting/fbs/cancel":     true,
 }
 
 var ErrReadOnly = errors.New("тестовый режим: изменяющий запрос заблокирован")
@@ -334,6 +335,37 @@ func (c *Client) Ship(ctx context.Context, p *Posting) error {
 		Result []string `json:"result"`
 	}
 	return c.call(ctx, "/v4/posting/fbs/ship", req, &resp)
+}
+
+// CancelReason — причина отмены отправления продавцом.
+type CancelReason struct {
+	ID    int64  `json:"id"`
+	Title string `json:"title"`
+}
+
+func (c *Client) CancelReasons(ctx context.Context) ([]CancelReason, error) {
+	var resp struct {
+		Result []CancelReason `json:"result"`
+	}
+	if err := c.call(ctx, "/v2/posting/fbs/cancel-reason/list", map[string]any{}, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Result, nil
+}
+
+// Cancel отменяет отправление (возможно в статусах «Ожидает сборки» и «Ожидает отгрузки»).
+func (c *Client) Cancel(ctx context.Context, postingNumber string, reasonID int64, message string) error {
+	var resp struct {
+		Result bool `json:"result"`
+	}
+	req := map[string]any{"posting_number": postingNumber, "cancel_reason_id": reasonID, "cancel_reason_message": message}
+	if err := c.call(ctx, "/v2/posting/fbs/cancel", req, &resp); err != nil {
+		return err
+	}
+	if !resp.Result {
+		return &OzonError{Status: 200, Path: "/v2/posting/fbs/cancel", Message: "Ozon не подтвердил отмену"}
+	}
+	return nil
 }
 
 // SetStatus — «Доставляется» / «Курьер в пути» / «Доставлено» для одного отправления.
