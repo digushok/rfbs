@@ -213,6 +213,7 @@ async function startQueue() {
   const p = S.profile, tid = $('#tplSel').value;
   if (!p.warehouse_id) return toast('Сначала выберите склад в «Настройках»', true);
   if (queueEdit && !tid) { await saveBatches(); if (queueEdit) return; }
+  if (hasHistory()) return appendQueue(tid, false);
   let html;
   if (tid) {
     const t = templates().find(x => x.id === tid);
@@ -230,6 +231,31 @@ async function startQueue() {
     await api('/api/queue/start', { id: p.id, template_id: tid });
     queueEdit = null; $('#tplSel').value = '';
     toast('Очередь начата');
+    await loadState(); setTimeout(() => { refreshRun(); loadProducts(); }, 600);
+  } catch (e) { toast(e.message, true); }
+}
+
+// «+ Добавить очередь»: пары сохранённой очереди (или партии «в очереди» из таблицы, если очередь не идёт) — в конец.
+async function appendQueue(tid, running) {
+  const p = S.profile;
+  if (queueEdit) { await saveBatches(); if (queueEdit) return; }
+  const src = batchSource(), next = src.length + 1;
+  let html;
+  if (tid) {
+    const t = templates().find(x => x.id === tid);
+    html = `<h3>Добавить очередь «${esc(t.name)}»?</h3><p>Пары встанут в конец текущей очереди. Партии, которые уже продаются или завершены, не изменятся.</p><div class="modal-list">${pairsList(t.rows, next)}</div>`;
+  } else {
+    const q = src.filter(b => ['queued', 'active', 'next'].includes(b.state));
+    if (!q.length) return toast('Новых партий нет — выберите сохранённую очередь в списке или добавьте партии', true);
+    html = `<h3>Продолжить очередь?</h3><p>Продолжатся партии из таблицы:</p><div class="modal-list">${q.map(b => `${b.num}. SKU ${b.sku1} + ${b.sku2} — ${b.qty} шт.`).join('<br>')}</div>`;
+  }
+  html += appendRule();
+  if (!running) html += p.live ? '' : '<p class="muted">Тестовый режим: в Ozon ничего не изменится, действия будут только в журнале.</p>';
+  if (!(await confirmBox(html, running ? 'Добавить' : 'Добавить и начать'))) return;
+  try {
+    await api('/api/queue/append', { id: p.id, template_id: tid });
+    queueEdit = null; $('#tplSel').value = '';
+    toast(running ? 'Очередь добавлена' : 'Очередь продолжена');
     await loadState(); setTimeout(() => { refreshRun(); loadProducts(); }, 600);
   } catch (e) { toast(e.message, true); }
 }
@@ -282,6 +308,17 @@ async function finishQueue() {
   } catch (er) { toast(er.message, true); }
 }
 
+// В таблице есть партии прошлой очереди (начатые, завершённые, не начатые после «Закончить»):
+// тогда вместо «Начать» — «Добавить очередь», она продолжает прошлую.
+function hasHistory() { return batchSource().some(b => b.state !== 'queued'); }
+
+function pairsList(rows, from) { return rows.map((r, i) => `${from + i}. SKU ${r.sku1} + ${r.sku2} — ${r.qty} шт.`).join('<br>'); }
+
+function appendRule() {
+  const n = S.profile.prestock_left == null ? 3 : S.profile.prestock_left;
+  return `<p class="muted">Если сейчас ничего не продаётся, первая новая пара сразу встанет в наличие. Если пара ещё продаётся — следующая выставится ${n > 0 ? `заранее, когда до её конца останется ${n} заказ(ов) или меньше` : 'после её полной распродажи'}.</p>`;
+}
+
 function renderQueueBar() {
   const on = run && run.running, st = $('#qState');
   $('#qIdle').classList.toggle('hidden', !!on);
@@ -292,7 +329,16 @@ function renderQueueBar() {
   $('#stockApply').classList.toggle('hidden', !on || run.finishing || run.paused);
   $('#pollNow').classList.toggle('hidden', !on);
   $('#runDot').className = 'dot' + (on ? ' on' : '') + (on && run.paused ? ' pause' : on && !S.profile.live ? ' test' : '');
-  if (!on) { $('#runInfo').innerHTML = 'Очередь не идёт. Выберите сохранённую очередь (или соберите партии в таблице ниже) и нажмите «Начать».'; return; }
+  const hist = hasHistory();
+  $('#qStart').textContent = hist ? '+ Добавить очередь' : '▶ Начать';
+  $('#qClear').classList.toggle('hidden', !!on || !hist);
+  $('#qAppend').classList.toggle('hidden', !on || run.finishing || !templates().length);
+  if (!on) {
+    $('#runInfo').innerHTML = hist
+      ? 'Очередь не идёт. Выберите сохранённую очередь и нажмите «Добавить очередь» — её пары встанут после прошлых, нумерация продолжится. Чтобы начать с нуля, нажмите «Очистить».'
+      : 'Очередь не идёт. Выберите сохранённую очередь (или соберите партии в таблице ниже) и нажмите «Начать».';
+    return;
+  }
   const name = run.queue_name ? ` «${esc(run.queue_name)}»` : '';
   const inWork = ((run.postings) || []).filter(v => !v.final).length;
   if (run.finishing) {
@@ -437,6 +483,15 @@ $('#batchNext').onclick = async () => {
 };
 
 $('#qStart').onclick = startQueue;
+$('#qAppend').onclick = async () => {
+  const names = templates().map(t => `<option value="${t.id}">${esc(t.name)} · пар: ${t.rows.length}</option>`).join('');
+  const tid = await choiceTpl(names, 'Добавить очередь', 'Пары выбранной сохранённой очереди встанут в конец текущей.');
+  if (tid) appendQueue(tid, true);
+};
+$('#qClear').onclick = async () => {
+  if (!(await confirmBox('<h3>Очистить список партий?</h3><p>Из таблицы уберутся все партии прошлой очереди, нумерация начнётся с 1. Журнал и история заказов сохранятся.</p>', 'Очистить', true))) return;
+  try { await api('/api/queue/clear', { id: S.profile.id }); queueEdit = null; await loadState(); await refreshRun(); loadProducts(); } catch (e) { toast(e.message, true); }
+};
 $('#qPause').onclick = pauseQueue;
 $('#qFinish').onclick = finishQueue;
 $('#pTest').onchange = async e => {
@@ -635,9 +690,9 @@ $('#tplSaveAs').onclick = async () => {
   } catch (er) { toast(er.message, true); }
 };
 
-function choiceTpl(options) {
+function choiceTpl(options, title = 'Заменить очередь', text = 'Партии «в очереди» будут заменены партиями выбранной сохранённой очереди. Партии в продаже не изменятся.') {
   return new Promise(res => {
-    $('#modalBody').innerHTML = `<h3>Заменить очередь</h3><p>Партии «в очереди» будут заменены партиями выбранной сохранённой очереди. Партии в продаже не изменятся.</p><select id="tplPick" class="full">${options}</select>`;
+    $('#modalBody').innerHTML = `<h3>${title}</h3><p>${text}</p><select id="tplPick" class="full">${options}</select>`;
     $('#modalYes').textContent = 'Дальше'; $('#modalYes').className = 'btn primary';
     $('#modal').classList.remove('hidden');
     const done = v => { $('#modal').classList.add('hidden'); $('#modalYes').onclick = $('#modalNo').onclick = null; res(v); };

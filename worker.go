@@ -1151,6 +1151,101 @@ func (m *Manager) StartQueue(id, tplID string) error {
 	return m.start(id)
 }
 
+// AppendQueue — кнопка «+ Добавить очередь»: пары сохранённой очереди встают в конец текущей.
+// Начатые и завершённые партии не меняются, нумерация продолжается. Если очередь идёт —
+// новые пары выставляются по обычным правилам (сразу, если в продаже ничего нет, или заранее
+// по порогу из настроек). Если очередь уже закончилась и работа остановлена — она продолжается
+// с новыми парами. tplID == "" — без новых пар: продолжить с партиями «в очереди» из таблицы.
+func (m *Manager) AppendQueue(id, tplID string) (added int, err error) {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+	running := m.IsRunning(id)
+	var lerr error
+	var name string
+	_, err = m.store.Update(id, func(p *Profile) {
+		if running && p.Finishing {
+			lerr = fmt.Errorf("очередь заканчивается — добавить пары нельзя")
+			return
+		}
+		var tpl *QueueTemplate
+		if tplID != "" {
+			for i := range p.Templates {
+				if p.Templates[i].ID == tplID {
+					tpl = &p.Templates[i]
+				}
+			}
+			if tpl == nil {
+				lerr = fmt.Errorf("сохранённая очередь не найдена")
+				return
+			}
+		} else if running {
+			lerr = fmt.Errorf("выберите сохранённую очередь")
+			return
+		}
+		out := append([]Batch(nil), p.Batches...)
+		if tpl != nil {
+			for _, row := range tpl.Rows {
+				out = append(out, Batch{ID: newID(), SKU1: row.SKU1, SKU2: row.SKU2, Qty: row.Qty, State: BatchQueued})
+			}
+			added, name = len(tpl.Rows), tpl.Name
+		}
+		open := 0
+		for _, b := range out {
+			if b.State == BatchQueued || b.State == BatchActive || b.State == BatchNext {
+				open++
+			}
+		}
+		if open == 0 {
+			lerr = fmt.Errorf("новых партий нет — выберите сохранённую очередь или добавьте партии")
+			return
+		}
+		p.Batches = out
+		if name != "" {
+			if p.QueueName == "" {
+				p.QueueName = name
+			} else {
+				p.QueueName += " + " + name
+			}
+		}
+		if !running {
+			p.QueueStarted = time.Now()
+			p.Paused, p.Finishing, p.StockOff = false, false, false
+		}
+	})
+	if err == nil {
+		err = lerr
+	}
+	if err != nil {
+		return 0, err
+	}
+	if name != "" {
+		m.Log(id).Add("info", "Добавлена очередь «%s»: %d пар(ы) в конец текущей.", name, added)
+	}
+	if running {
+		m.Kick(id)
+		return added, nil
+	}
+	m.Log(id).Add("info", "Очередь продолжена.")
+	return added, m.start(id)
+}
+
+// ClearQueue — кнопка «Очистить»: убрать все партии прошлой очереди, чтобы начать с нуля.
+// Только когда очередь не идёт. Журнал заказов не трогается.
+func (m *Manager) ClearQueue(id string) error {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+	if m.IsRunning(id) {
+		return fmt.Errorf("очередь идёт — сначала закончите её")
+	}
+	_, err := m.store.Update(id, func(p *Profile) {
+		p.Batches, p.QueueName = nil, ""
+	})
+	if err == nil {
+		m.Log(id).Add("info", "Список партий очищен.")
+	}
+	return err
+}
+
 // SetPaused — кнопки «Пауза» / «Продолжить». Остаток обнуляет и возвращает работник в ближайшем цикле.
 func (m *Manager) SetPaused(id string, paused bool) error {
 	m.opMu.Lock()

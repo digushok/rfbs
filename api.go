@@ -433,6 +433,13 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	s.handle(mux, "/api/queue/start", func(r *http.Request, b map[string]any) (any, error) {
 		return map[string]any{"ok": true}, s.mgr.StartQueue(s.id(r, b), str(b, "template_id"))
 	})
+	s.handle(mux, "/api/queue/append", func(r *http.Request, b map[string]any) (any, error) {
+		n, err := s.mgr.AppendQueue(s.id(r, b), str(b, "template_id"))
+		return map[string]any{"ok": true, "added": n}, err
+	})
+	s.handle(mux, "/api/queue/clear", func(r *http.Request, b map[string]any) (any, error) {
+		return map[string]any{"ok": true}, s.mgr.ClearQueue(s.id(r, b))
+	})
 	s.handle(mux, "/api/queue/pause", func(r *http.Request, b map[string]any) (any, error) {
 		v, _ := b["paused"].(bool)
 		return map[string]any{"ok": true}, s.mgr.SetPaused(s.id(r, b), v)

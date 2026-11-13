@@ -54,9 +54,11 @@
         <div class="row wrap tight" id="qIdle">
           <select id="tplSel" class="tplsel"></select>
           <button class="btn primary lg" id="qStart">▶ Начать</button>
+          <button class="btn ghost hidden" id="qClear" title="Убрать из таблицы все партии прошлой очереди, чтобы начать с нуля">Очистить</button>
         </div>
         <div class="row wrap tight hidden" id="qRun">
           <span id="qState" class="qstate"></span>
+          <button class="btn soft lg" id="qAppend" title="Пары сохранённой очереди встанут в конец текущей">+ Добавить очередь</button>
           <button class="btn soft lg" id="qPause">⏸ Пауза</button>
           <button class="btn stop lg" id="qFinish">■ Закончить</button>
         </div>
