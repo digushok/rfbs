@@ -1080,14 +1080,16 @@ func (m *Manager) ResetPreview(id string) (ResetInfo, error) {
 }
 
 // StartQueue — кнопка «Начать»: с сохранённой очереди (tplID) или с партий в таблице.
-func (m *Manager) StartQueue(id, tplID string) error {
+func (m *Manager) StartQueue(id, tplID string) error { return m.StartQueueNamed(id, tplID, "") }
+
+// StartQueueNamed — «Начать» с партиями из таблицы; name — имя сохранённой очереди, которой заполнили таблицу.
+func (m *Manager) StartQueueNamed(id, tplID, name string) error {
 	m.opMu.Lock()
 	defer m.opMu.Unlock()
 	if m.IsRunning(id) {
 		return fmt.Errorf("очередь уже идёт")
 	}
 	var lerr error
-	var name string
 	_, err := m.store.Update(id, func(p *Profile) {
 		var tpl *QueueTemplate
 		if tplID != "" {
@@ -1155,13 +1157,13 @@ func (m *Manager) StartQueue(id, tplID string) error {
 // Начатые и завершённые партии не меняются, нумерация продолжается. Если очередь идёт —
 // новые пары выставляются по обычным правилам (сразу, если в продаже ничего нет, или заранее
 // по порогу из настроек). Если очередь уже закончилась и работа остановлена — она продолжается
-// с новыми парами. tplID == "" — без новых пар: продолжить с партиями «в очереди» из таблицы.
-func (m *Manager) AppendQueue(id, tplID string) (added int, err error) {
+// с новыми парами. tplID == "" — без новых пар: продолжить с партиями «в очереди» из таблицы
+// (name — имя сохранённой очереди, которой заполнили таблицу).
+func (m *Manager) AppendQueue(id, tplID, name string) (added int, err error) {
 	m.opMu.Lock()
 	defer m.opMu.Unlock()
 	running := m.IsRunning(id)
 	var lerr error
-	var name string
 	_, err = m.store.Update(id, func(p *Profile) {
 		if running && p.Finishing {
 			lerr = fmt.Errorf("очередь заканчивается — добавить пары нельзя")
@@ -1218,8 +1220,10 @@ func (m *Manager) AppendQueue(id, tplID string) (added int, err error) {
 	if err != nil {
 		return 0, err
 	}
-	if name != "" {
+	if added > 0 {
 		m.Log(id).Add("info", "Добавлена очередь «%s»: %d пар(ы) в конец текущей.", name, added)
+	} else if name != "" {
+		m.Log(id).Add("info", "Добавлена очередь «%s».", name)
 	}
 	if running {
 		m.Kick(id)

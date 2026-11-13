@@ -431,10 +431,10 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	})
 
 	s.handle(mux, "/api/queue/start", func(r *http.Request, b map[string]any) (any, error) {
-		return map[string]any{"ok": true}, s.mgr.StartQueue(s.id(r, b), str(b, "template_id"))
+		return map[string]any{"ok": true}, s.mgr.StartQueueNamed(s.id(r, b), str(b, "template_id"), str(b, "queue_name"))
 	})
 	s.handle(mux, "/api/queue/append", func(r *http.Request, b map[string]any) (any, error) {
-		n, err := s.mgr.AppendQueue(s.id(r, b), str(b, "template_id"))
+		n, err := s.mgr.AppendQueue(s.id(r, b), str(b, "template_id"), str(b, "queue_name"))
 		return map[string]any{"ok": true, "added": n}, err
 	})
 	s.handle(mux, "/api/queue/clear", func(r *http.Request, b map[string]any) (any, error) {

@@ -209,53 +209,44 @@ function choiceBox(html, choices) {
   });
 }
 
-async function startQueue() {
-  const p = S.profile, tid = $('#tplSel').value;
-  if (!p.warehouse_id) return toast('Сначала выберите склад в «Настройках»', true);
-  if (queueEdit && !tid) { await saveBatches(); if (queueEdit) return; }
-  if (hasHistory()) return appendQueue(tid, false);
-  let html;
-  if (tid) {
-    const t = templates().find(x => x.id === tid);
-    html = `<h3>Начать очередь «${esc(t.name)}»?</h3><div class="modal-list">${t.rows.map((r, i) => `${i + 1}. SKU ${r.sku1} + ${r.sku2} — ${r.qty} шт.`).join('<br>')}</div>`;
-  } else {
-    const q = batchSource().filter(b => ['queued', 'active', 'next'].includes(b.state));
-    if (!q.length) return toast('В очереди нет партий — выберите сохранённую очередь или добавьте партии', true);
-    html = `<h3>Начать очередь из таблицы?</h3><div class="modal-list">${q.map(b => `${b.num}. SKU ${b.sku1} + ${b.sku2} — ${b.qty} шт.`).join('<br>')}</div>`;
+// Выбор сохранённой очереди в списке сразу заполняет таблицу её парами — как будто их ввели вручную:
+// можно поправить, добавить или удалить пары, а потом нажать «Начать» / «Добавить очередь».
+let tplName = '';            // имя выбранной сохранённой очереди — станет именем очереди при «Начать»
+function tplRows(t) { return t.rows.map(r => ({ sku1: String(r.sku1), sku2: String(r.sku2), qty: String(r.qty) })); }
+
+async function previewTemplate(tid) {
+  const t = templates().find(x => x.id === tid);
+  if (!t) { tplName = ''; return; }
+  const queued = (queueEdit || batchSource().filter(b => b.state === 'queued')).filter(b => b.sku1 || b.sku2);
+  if (queued.length && !(await confirmBox(`<h3>Заменить партии «в очереди»?</h3><p>В таблице ${queued.length} парт. «в очереди» — они заменятся парами очереди «${esc(t.name)}». Начатые и завершённые партии не изменятся.</p>`, 'Заменить'))) {
+    $('#tplSel').value = ''; tplName = ''; return;
   }
+  queueEdit = tplRows(t);
+  tplName = t.name;
+  renderBatches();
+  toast(`Пары очереди «${t.name}» в таблице — можно поправить и нажать «${hasHistory() ? 'Добавить очередь' : 'Начать'}»`);
+}
+
+async function startQueue() {
+  const p = S.profile, hist = hasHistory();
+  if (!p.warehouse_id) return toast('Сначала выберите склад в «Настройках»', true);
+  if (queueEdit) { await saveBatches(); if (queueEdit) return; }
+  const src = batchSource();
+  const q = src.filter(b => ['queued', 'active', 'next'].includes(b.state));
+  if (!q.length) return toast('В таблице нет новых партий — выберите сохранённую очередь в списке или добавьте партии', true);
+  const name = tplName ? ` «${esc(tplName)}»` : '';
+  let html = hist
+    ? `<h3>Добавить очередь${name}?</h3><p>Пары встанут после партий прошлой очереди, нумерация продолжится:</p>`
+    : `<h3>Начать очередь${name}?</h3>`;
+  html += `<div class="modal-list">${q.map(b => `${b.num}. SKU ${b.sku1} + ${b.sku2} — ${b.qty} шт.`).join('<br>')}</div>`;
   html += p.live
     ? '<p>Программа выставит остаток первой паре и начнёт проводить её заказы в Ozon.</p>'
     : '<p class="muted">Тестовый режим: в Ozon ничего не изменится, действия будут только в журнале.</p>';
-  if (!(await confirmBox(html, 'Начать'))) return;
+  if (!(await confirmBox(html, hist ? 'Добавить и начать' : 'Начать'))) return;
   try {
-    await api('/api/queue/start', { id: p.id, template_id: tid });
-    queueEdit = null; $('#tplSel').value = '';
-    toast('Очередь начата');
-    await loadState(); setTimeout(() => { refreshRun(); loadProducts(); }, 600);
-  } catch (e) { toast(e.message, true); }
-}
-
-// «+ Добавить очередь»: пары сохранённой очереди (или партии «в очереди» из таблицы, если очередь не идёт) — в конец.
-async function appendQueue(tid, running) {
-  const p = S.profile;
-  if (queueEdit) { await saveBatches(); if (queueEdit) return; }
-  const src = batchSource(), next = src.length + 1;
-  let html;
-  if (tid) {
-    const t = templates().find(x => x.id === tid);
-    html = `<h3>Добавить очередь «${esc(t.name)}»?</h3><p>Пары встанут в конец текущей очереди. Партии, которые уже продаются или завершены, не изменятся.</p><div class="modal-list">${pairsList(t.rows, next)}</div>`;
-  } else {
-    const q = src.filter(b => ['queued', 'active', 'next'].includes(b.state));
-    if (!q.length) return toast('Новых партий нет — выберите сохранённую очередь в списке или добавьте партии', true);
-    html = `<h3>Продолжить очередь?</h3><p>Продолжатся партии из таблицы:</p><div class="modal-list">${q.map(b => `${b.num}. SKU ${b.sku1} + ${b.sku2} — ${b.qty} шт.`).join('<br>')}</div>`;
-  }
-  html += appendRule();
-  if (!running) html += p.live ? '' : '<p class="muted">Тестовый режим: в Ozon ничего не изменится, действия будут только в журнале.</p>';
-  if (!(await confirmBox(html, running ? 'Добавить' : 'Добавить и начать'))) return;
-  try {
-    await api('/api/queue/append', { id: p.id, template_id: tid });
-    queueEdit = null; $('#tplSel').value = '';
-    toast(running ? 'Очередь добавлена' : 'Очередь продолжена');
+    await api(hist ? '/api/queue/append' : '/api/queue/start', { id: p.id, template_id: '', queue_name: tplName });
+    queueEdit = null; tplName = ''; $('#tplSel').value = '';
+    toast(hist ? 'Очередь продолжена' : 'Очередь начата');
     await loadState(); setTimeout(() => { refreshRun(); loadProducts(); }, 600);
   } catch (e) { toast(e.message, true); }
 }
@@ -312,12 +303,7 @@ async function finishQueue() {
 // тогда вместо «Начать» — «Добавить очередь», она продолжает прошлую.
 function hasHistory() { return batchSource().some(b => b.state !== 'queued'); }
 
-function pairsList(rows, from) { return rows.map((r, i) => `${from + i}. SKU ${r.sku1} + ${r.sku2} — ${r.qty} шт.`).join('<br>'); }
 
-function appendRule() {
-  const n = S.profile.prestock_left == null ? 3 : S.profile.prestock_left;
-  return `<p class="muted">Если сейчас ничего не продаётся, первая новая пара сразу встанет в наличие. Если пара ещё продаётся — следующая выставится ${n > 0 ? `заранее, когда до её конца останется ${n} заказ(ов) или меньше` : 'после её полной распродажи'}.</p>`;
-}
 
 function renderQueueBar() {
   const on = run && run.running, st = $('#qState');
@@ -335,8 +321,8 @@ function renderQueueBar() {
   $('#qAppend').classList.toggle('hidden', !on || run.finishing || !templates().length);
   if (!on) {
     $('#runInfo').innerHTML = hist
-      ? 'Очередь не идёт. Выберите сохранённую очередь и нажмите «Добавить очередь» — её пары встанут после прошлых, нумерация продолжится. Чтобы начать с нуля, нажмите «Очистить».'
-      : 'Очередь не идёт. Выберите сохранённую очередь (или соберите партии в таблице ниже) и нажмите «Начать».';
+      ? 'Очередь не идёт. Выберите сохранённую очередь — её пары появятся в таблице после прошлых (или впишите пары сами через «+ Партия»), при необходимости поправьте и нажмите «Добавить очередь». Чтобы начать с нуля, нажмите «Очистить».'
+      : 'Очередь не идёт. Выберите сохранённую очередь — её пары появятся в таблице (или впишите пары сами через «+ Партия»), при необходимости поправьте и нажмите «Начать».';
     return;
   }
   const name = run.queue_name ? ` «${esc(run.queue_name)}»` : '';
@@ -437,7 +423,7 @@ $$('.tabs button').forEach(b => b.onclick = () => {
   $$('.tab').forEach(t => t.classList.toggle('hidden', t.id !== 'tab-' + b.dataset.tab));
   if (b.dataset.tab === 'log') { renderLog(); const box = $('#logList'); box.scrollTop = box.scrollHeight; }
 });
-$('#shopSel').onchange = async e => { await api('/api/profile/select', { id: e.target.value }); run = null; queueEdit = null; tplEdit = {}; await loadState(); refreshRun(); refreshLog(); loadProducts(); };
+$('#shopSel').onchange = async e => { await api('/api/profile/select', { id: e.target.value }); run = null; queueEdit = null; tplName = ''; tplEdit = {}; await loadState(); refreshRun(); refreshLog(); loadProducts(); };
 $('#quitBtn').onclick = async () => {
   const anyRun = S.shops.some(s => s.running);
   if (!(await confirmBox(`<h3>Закрыть программу?</h3>${anyRun ? '<p>Очередь продолжится при следующем запуске программы. Пока программа закрыта, статусы заказов не меняются.</p>' : ''}`, 'Закрыть'))) return;
@@ -483,10 +469,17 @@ $('#batchNext').onclick = async () => {
 };
 
 $('#qStart').onclick = startQueue;
+$('#tplSel').onchange = e => previewTemplate(e.target.value);
 $('#qAppend').onclick = async () => {
+  // На ходу: пары сохранённой очереди добавляются в конец таблицы — проверить, поправить и «Сохранить очередь».
   const names = templates().map(t => `<option value="${t.id}">${esc(t.name)} · пар: ${t.rows.length}</option>`).join('');
-  const tid = await choiceTpl(names, 'Добавить очередь', 'Пары выбранной сохранённой очереди встанут в конец текущей.');
-  if (tid) appendQueue(tid, true);
+  const tid = await choiceTpl(names, 'Добавить очередь', 'Пары выбранной сохранённой очереди появятся в конце таблицы. Проверьте их, при необходимости поправьте и нажмите «Сохранить очередь».');
+  const t = templates().find(x => x.id === tid);
+  if (!t) return;
+  editQueue().push(...tplRows(t));
+  renderBatches();
+  toast(`Пары «${t.name}» добавлены в таблицу — проверьте и нажмите «Сохранить очередь»`);
+  $('#batchSave').scrollIntoView({ behavior: 'smooth', block: 'center' });
 };
 $('#qClear').onclick = async () => {
   if (!(await confirmBox('<h3>Очистить список партий?</h3><p>Из таблицы уберутся все партии прошлой очереди, нумерация начнётся с 1. Журнал и история заказов сохранятся.</p>', 'Очистить', true))) return;
@@ -574,7 +567,7 @@ function templates() { return (S.profile && S.profile.templates) || []; }
 
 function renderTplSelect() {
   const sel = $('#tplSel'), cur = sel.value, list = templates();
-  sel.innerHTML = '<option value="">— партии из таблицы ниже —</option>' + list.map(t => `<option value="${t.id}">${esc(t.name)} · пар: ${t.rows.length}</option>`).join('');
+  sel.innerHTML = '<option value="">— сохранённая очередь —</option>' + list.map(t => `<option value="${t.id}">${esc(t.name)} · пар: ${t.rows.length}</option>`).join('');
   if (list.some(t => t.id === cur)) sel.value = cur;
 }
 

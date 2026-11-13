@@ -55,10 +55,10 @@ func TestAppendQueueAfterComplete(t *testing.T) {
 		p.QueueName = "Первая"
 		p.Templates = []QueueTemplate{{ID: "t1", Name: "Вторая", Rows: []TplRow{{SKU1: mockSKU3, SKU2: mockSKU4, Qty: 2}, {SKU1: mockSKU1, SKU2: mockSKU2, Qty: 3}}}}
 	})
-	if _, err := mgr.AppendQueue(id, ""); err == nil {
+	if _, err := mgr.AppendQueue(id, "", ""); err == nil {
 		t.Fatalf("без новых партий продолжать нечего")
 	}
-	if n, err := mgr.AppendQueue(id, "t1"); err != nil || n != 2 {
+	if n, err := mgr.AppendQueue(id, "t1", ""); err != nil || n != 2 {
 		t.Fatalf("добавление: %d %v", n, err)
 	}
 	if !mgr.IsRunning(id) {
@@ -73,7 +73,7 @@ func TestAppendQueueAfterComplete(t *testing.T) {
 		t.Fatalf("очищать идущую очередь нельзя")
 	}
 	// Пока идёт — ещё одна очередь встаёт в конец.
-	if n, err := mgr.AppendQueue(id, "t1"); err != nil || n != 2 {
+	if n, err := mgr.AppendQueue(id, "t1", ""); err != nil || n != 2 {
 		t.Fatalf("добавление на ходу: %d %v", n, err)
 	}
 	p, _ = store.Get(id)
@@ -88,5 +88,29 @@ func TestAppendQueueAfterComplete(t *testing.T) {
 	}
 	if p, _ := store.Get(id); len(p.Batches) != 0 || p.QueueName != "" {
 		t.Fatalf("после очистки: %v", p.Batches)
+	}
+}
+
+// Таблицу заполнили сохранённой очередью и нажали «Начать» / «Добавить очередь»: имя очереди сохраняется.
+func TestQueueNameFromFilledTable(t *testing.T) {
+	mgr, store, _, id := newMgr(t)
+	if err := mgr.StartQueueNamed(id, "", "Первая"); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := store.Get(id); p.QueueName != "Первая" {
+		t.Fatalf("имя: %q", p.QueueName)
+	}
+	mgr.Stop(id, true)
+	store.Update(id, func(p *Profile) {
+		for i := range p.Batches {
+			p.Batches[i].State, p.Batches[i].ZeroDone = BatchDone, true
+		}
+		p.Batches = append(p.Batches, Batch{ID: "n1", SKU1: mockSKU3, SKU2: mockSKU4, Qty: 2, State: BatchQueued})
+	})
+	if _, err := mgr.AppendQueue(id, "", "Вторая"); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := store.Get(id); p.QueueName != "Первая + Вторая" || !mgr.IsRunning(id) {
+		t.Fatalf("имя: %q, идёт: %v", p.QueueName, mgr.IsRunning(id))
 	}
 }
