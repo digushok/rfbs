@@ -1481,7 +1481,7 @@ func (m *Manager) AddStock(ctx context.Context, id, batchID string, n int) ([]st
 		batchName(num, b), n, stocksText(avail))
 	err = w.setStocks(ctx, want)
 	if err == nil && p.Live {
-		m.Log(id).Add("ok", "%s: остаток выставлен — %s.", batchName(num, b), stocksText(want))
+		m.Log(id).Add("ok", "%s: остаток выставлен — %s", batchName(num, b), stocksText(want))
 	}
 	var msgs []string
 	for _, ln := range m.Log(id).Since(seq) {
