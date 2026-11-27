@@ -266,3 +266,32 @@ func TestPauseKeepsProcessing(t *testing.T) {
 		t.Fatalf("после «Продолжить» распроданная партия завершается и выставляется следующая: %v %v", st, m.stock)
 	}
 }
+
+// «+ на склад»: к свободному остатку пары в продаже добавляется n шт., партия не меняется.
+func TestAddStock(t *testing.T) {
+	mgr, store, m, id := newMgr(t)
+	if err := mgr.StartQueue(id, ""); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { p, _ := store.Get(id); return p.ActiveBatch() != nil })
+	p, _ := store.Get(id)
+	b := p.ActiveBatch()
+	m.mu.Lock()
+	m.stock[mockSKU1], m.stock[mockSKU2] = 0, 2
+	m.mu.Unlock()
+	if _, err := mgr.AddStock(context.Background(), id, b.ID, 3); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	s1, s2 := m.stock[mockSKU1], m.stock[mockSKU2]
+	m.mu.Unlock()
+	if s1 != 3 || s2 != 5 {
+		t.Fatalf("остаток после «+ на склад 3»: %d и %d, ждали 3 и 5", s1, s2)
+	}
+	if p2, _ := store.Get(id); p2.ActiveBatch().Qty != b.Qty || p2.ActiveBatch().Sold != b.Sold {
+		t.Fatalf("партия не должна меняться")
+	}
+	if _, err := mgr.AddStock(context.Background(), id, p.Batches[2].ID, 1); err == nil {
+		t.Fatalf("пару в очереди пополнять нельзя")
+	}
+}

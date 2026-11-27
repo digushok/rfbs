@@ -301,6 +301,19 @@ func (s *Server) Routes(mux *http.ServeMux) {
 		return map[string]any{"warehouses": ws}, nil
 	})
 
+	s.handle(mux, "/api/stock/add", func(r *http.Request, b map[string]any) (any, error) {
+		n, ok := num(b, "add")
+		if !ok {
+			return nil, fmt.Errorf("укажите количество")
+		}
+		ctx, cancel := ctx30()
+		defer cancel()
+		msgs, err := s.mgr.AddStock(ctx, s.id(r, b), str(b, "batch_id"), int(n))
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"messages": msgs}, nil
+	})
 	s.handle(mux, "/api/products", func(r *http.Request, b map[string]any) (any, error) {
 		p, ok := s.store.Get(s.id(r, b))
 		if !ok {

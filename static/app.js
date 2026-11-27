@@ -141,7 +141,9 @@ function renderBatches() {
       : b.state === 'skipped'
       ? '<span class="chip">не начата</span><div class="muted small">очередь закончили раньше</div>'
       : `<span class="chip ${b.in_work ? 'warn' : 'ok'}">${b.in_work ? 'доставляется' : 'завершена'}</span> продано ${b.sold} из ${b.qty}<div class="muted small">в работе ${b.in_work}, доставлено ${b.delivered}</div>`;
-    const act = (b.state === 'done' && !b.in_work) || b.state === 'skipped' ? `<button class="btn ghost sm" data-rm="${b.id}" title="Убрать из списка. Её заказы всё равно будут доведены до конца.">Убрать</button>` : '';
+    const onSale = (b.state === 'active' || b.state === 'next') && run && run.running && !run.paused && !run.finishing;
+    const act = (b.state === 'done' && !b.in_work) || b.state === 'skipped' ? `<button class="btn ghost sm" data-rm="${b.id}" title="Убрать из списка. Её заказы всё равно будут доведены до конца.">Убрать</button>`
+      : onSale ? `<button class="btn soft sm" data-addstock="${b.id}" title="Добавить штук на склад обоим SKU пары — например, если товар завис в резерве. Количество партии не меняется.">+ на склад</button>` : '';
     return `<tr class="${b.state}" data-keep="${b.id}"><td class="bn">${n}</td><td>${b.sku1}${name(b.sku1)}</td><td>${b.sku2}${name(b.sku2)}</td><td class="r">${b.qty}</td><td>${st}</td><td class="r">${act}</td></tr>`;
   }).concat(queued.map((b, i) => {
     n++;
@@ -453,6 +455,22 @@ $('#batchTable').addEventListener('click', async e => {
     else { const j = d.up !== undefined ? i - 1 : i + 1; if (j >= 0 && j < q.length) [q[i], q[j]] = [q[j], q[i]]; }
     if (document.activeElement) document.activeElement.blur();
     renderBatches();
+  }
+  if (d.addstock) {
+    const b = batchSource().find(x => x.id === d.addstock);
+    if (!b) return;
+    const ask = promptBox(`<h3>Добавить на склад</h3><p>SKU ${b.sku1} + ${b.sku2}: к свободному остатку каждого SKU добавится указанное количество${S.profile.live ? '' : ' (тест — только в журнале)'}. Количество в партии и счёт «продано» не меняются.</p><p class="muted">Нужно, когда товар завис в резерве (заказ не оформился), а партию надо распродать, не дожидаясь, пока резерв вернётся в наличие.</p><label class="fld">Сколько штук добавить</label>`, '1', 'Добавить');
+    $('#promptIn').setAttribute('inputmode', 'numeric');
+    const n = await ask;
+    if (n === null) return;
+    const add = parseInt(n, 10);
+    if (!(add > 0)) return toast('Введите число больше нуля', true);
+    try {
+      const j = await api('/api/stock/add', { id: S.profile.id, batch_id: b.id, add });
+      toast(j.messages.length ? j.messages[j.messages.length - 1] : 'Остаток добавлен');
+      setTimeout(loadProducts, 800);
+    } catch (er) { toast(er.message, true); }
+    return;
   }
   if (d.rm) {
     if (!(await confirmBox('<h3>Убрать партию из списка?</h3><p>Её заказы, которые уже в работе, всё равно будут доведены до «Условно доставлен».</p>', 'Убрать'))) return;

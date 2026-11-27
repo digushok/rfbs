@@ -1415,6 +1415,81 @@ func (m *Manager) ResetTest(id string) error {
 }
 
 // ApplyStock заново выставляет остаток активной партии (в тестовом режиме только описывает действие).
+// AddStock — кнопка «+ на склад» у пары в продаже: добавить n шт. к свободному остатку обоих SKU пары.
+// Партия (количество, продано) не меняется. Нужно, когда товар завис в резерве (заказ не оформился),
+// а партию надо распродать, не дожидаясь, пока резерв вернётся в наличие.
+func (m *Manager) AddStock(ctx context.Context, id, batchID string, n int) ([]string, error) {
+	p, ok := m.store.Get(id)
+	if !ok {
+		return nil, fmt.Errorf("магазин не найден")
+	}
+	if err := p.Validate(); err != nil {
+		return nil, err
+	}
+	if n <= 0 {
+		return nil, fmt.Errorf("укажите, сколько добавить (больше нуля)")
+	}
+	if p.Paused || p.StockOff {
+		return nil, fmt.Errorf("очередь на паузе, остаток обнулён — сначала нажмите «Продолжить»")
+	}
+	// Состояние партий берём у работника: в тестовом режиме оно симулируется и в настройках не хранится.
+	var b *Batch
+	num := 0
+	m.mu.Lock()
+	wk := m.workers[id]
+	m.mu.Unlock()
+	if wk != nil {
+		wk.mu.Lock()
+		for _, v := range wk.bviews {
+			if v.ID == batchID {
+				bb := v.Batch
+				b, num = &bb, v.Num
+			}
+		}
+		wk.mu.Unlock()
+	}
+	if b == nil {
+		for i := range p.Batches {
+			if p.Batches[i].ID == batchID {
+				b, num = &p.Batches[i], i+1
+			}
+		}
+	}
+	if b == nil {
+		return nil, fmt.Errorf("партия не найдена")
+	}
+	if b.State != BatchActive && b.State != BatchNext {
+		return nil, fmt.Errorf("добавить на склад можно только пару, которая сейчас продаётся")
+	}
+	c := NewClient(&p, m.mocks)
+	c.readOnly = !p.Live
+	w := NewWorker(p, c, LoadJournal(m.journalPath(&p)), m.Log(id))
+	skus := []int64{b.SKU1, b.SKU2}
+	if b.SKU1 == b.SKU2 {
+		skus = skus[:1]
+	}
+	avail, err := w.available(ctx, skus)
+	if err != nil {
+		return nil, fmt.Errorf("не удалось узнать остаток в Ozon: %v", err)
+	}
+	want := map[int64]int{}
+	for _, sku := range skus {
+		want[sku] = avail[sku] + n
+	}
+	seq := m.Log(id).LastSeq()
+	m.Log(id).Add("info", "%s: «+ на склад» %d шт. (было свободно: %s). Количество партии не меняется.",
+		batchName(num, b), n, stocksText(avail))
+	err = w.setStocks(ctx, want)
+	if err == nil && p.Live {
+		m.Log(id).Add("ok", "%s: остаток выставлен — %s.", batchName(num, b), stocksText(want))
+	}
+	var msgs []string
+	for _, ln := range m.Log(id).Since(seq) {
+		msgs = append(msgs, ln.Text)
+	}
+	return msgs, err
+}
+
 func (m *Manager) ApplyStock(ctx context.Context, id string, qty int) ([]string, error) {
 	p, ok := m.store.Get(id)
 	if !ok {
