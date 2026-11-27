@@ -185,9 +185,11 @@ type Worker struct {
 
 func NewWorker(prof Profile, client *Client, journal *Journal, log *ShopLog) *Worker {
 	client.readOnly = !prof.Live
-	return &Worker{prof: prof, client: client, journal: journal, log: log, clock: time.Now,
+	w := &Worker{prof: prof, client: client, journal: journal, log: log, clock: time.Now,
 		kick: make(chan struct{}, 1), loggedFor: map[string]bool{}, badStatus: map[string]bool{},
 		sim: map[string]Batch{}, btDirty: map[string]bool{}, productInfo: map[int64]*ProductInfo{}}
+	journal.clock = w.now // старые записи журнала считаются по тем же часам, что и шаги
+	return w
 }
 
 // now — текущее время по часам Ozon (часы компьютера + измеренная разница).
@@ -437,9 +439,11 @@ func (w *Worker) Tick(ctx context.Context) time.Time {
 			pend = append(pend, a)
 		}
 	}
-	if w.pauseStock(ctx) { // на паузе статусы не меняются и партии не переключаются
-		pend = append(pend, w.planDelivered(now)...)
-		w.execute(ctx, pend, now)
+	// Заказы ведутся всегда, в том числе на паузе: пауза только обнуляет остаток пар в продаже.
+	stockOK := w.pauseStock(ctx)
+	pend = append(pend, w.planDelivered(now)...)
+	w.execute(ctx, pend, now)
+	if stockOK { // на паузе (и пока остаток обнуляется / возвращается) партии не переключаются и не выставляются
 		w.manageBatches(ctx, now)
 	}
 	w.handleForeign(ctx, foreign, now)

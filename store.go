@@ -404,6 +404,7 @@ type Journal struct {
 	path    string
 	mu      sync.Mutex
 	dirty   bool
+	clock   func() time.Time   // часы для очистки старых записей (работник подставляет свои; nil — часы компьютера)
 	Entries map[string]*JEntry `json:"entries"`
 	Foreign map[string]*FEntry `json:"foreign,omitempty"` // нецелевые заказы, по которым программа что-то сделала
 }
@@ -499,6 +500,9 @@ func (j *Journal) Save() error {
 		return nil
 	}
 	now := time.Now()
+	if j.clock != nil {
+		now = j.clock()
+	}
 	for k, e := range j.Entries {
 		if (e.Final != "" && now.Sub(e.FinalAt) > 7*24*time.Hour) || (!e.SeenAt.IsZero() && now.Sub(e.SeenAt) > 45*24*time.Hour) {
 			delete(j.Entries, k)

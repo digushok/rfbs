@@ -358,7 +358,7 @@ func (w *Worker) setStockOff(v bool) {
 }
 
 // pauseStock: на паузе обнуляет остаток пар в продаже, после «Продолжить» возвращает оставшееся количество.
-// Возвращает true, если остаток сейчас в обычном состоянии (можно управлять партиями).
+// Заказы на паузе ведутся как обычно. Возвращает true, если остаток сейчас в обычном состоянии (можно управлять партиями).
 func (w *Worker) pauseStock(ctx context.Context) bool {
 	switch {
 	case w.prof.Paused && !w.prof.StockOff:
@@ -373,7 +373,7 @@ func (w *Worker) pauseStock(ctx context.Context) bool {
 			return false
 		}
 		w.setStockOff(true)
-		w.log.Add("info", "Пауза: остаток пар в продаже обнулён, статусы заказов не меняются. Нажмите «Продолжить», чтобы вернуть остаток и продолжить.")
+		w.log.Add("info", "Пауза: остаток пар в продаже обнулён, новые заказы не придут. Заказы в работе (и пришедшие до обнуления) программа доводит как обычно. «Продолжить» вернёт остаток.")
 		return false
 	case !w.prof.Paused && w.prof.StockOff:
 		var errs []string

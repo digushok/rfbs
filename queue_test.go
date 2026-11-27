@@ -124,8 +124,11 @@ func TestPauseResume(t *testing.T) {
 		ck.add(61 * time.Second)
 		w.Tick(ctx)
 	}
-	if o.Status != "awaiting_packaging" {
-		t.Fatalf("на паузе статусы менять нельзя: %s", o.Status)
+	if o.Status == "awaiting_packaging" {
+		t.Fatalf("на паузе заказ в работе должен вестись дальше: %s", o.Status)
+	}
+	if m.stock[mockSKU1] != 0 || m.stock[mockSKU3] != 0 {
+		t.Fatalf("на паузе остаток не возвращается и следующая партия не выставляется: %v", m.stock)
 	}
 	store.Update(id, func(p *Profile) { p.Paused = false })
 	w.Tick(ctx)
@@ -134,9 +137,6 @@ func TestPauseResume(t *testing.T) {
 	}
 	if p, _ := store.Get(id); p.StockOff {
 		t.Fatalf("флаг паузы остатка не снят")
-	}
-	if o.Status != "awaiting_deliver" {
-		t.Fatalf("после «Продолжить» заказ должен пойти дальше: %s", o.Status)
 	}
 }
 
@@ -237,4 +237,32 @@ func waitFor(t *testing.T, cond func() bool) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("условие не выполнилось")
+}
+
+// На паузе заказы ведутся: пришедший заказ доводится до «Условно доставлен». Партия, распроданная на паузе,
+// после «Продолжить» завершается, и выставляется следующая.
+func TestPauseKeepsProcessing(t *testing.T) {
+	w, m, ck, store, id := setupBatches(t, true, [3]int{1, 3, 4}, false)
+	ctx := context.Background()
+	w.Tick(ctx)
+	store.Update(id, func(p *Profile) { p.Paused = true })
+	w.Tick(ctx)
+	if m.stock[mockSKU1] != 0 {
+		t.Fatalf("на паузе остаток обнулён: %v", m.stock)
+	}
+	o := m.AddPosting("target") // успел прийти до обнуления
+	o.AnalyticsData.DeliveryDateEnd.Time = ck.t.Add(10 * time.Minute)
+	run(w, ck, 10)
+	if !delivered(o) {
+		t.Fatalf("на паузе заказ должен быть доведён до «Условно доставлен»: %s", o.Status)
+	}
+	if st := states(store, id); st[0] != BatchActive || st[1] != BatchQueued || m.stock[mockSKU3] != 0 {
+		t.Fatalf("на паузе партии не переключаются: %v %v", st, m.stock)
+	}
+	store.Update(id, func(p *Profile) { p.Paused = false })
+	w.Tick(ctx)
+	w.Tick(ctx)
+	if st := states(store, id); st[0] != BatchDone || st[1] != BatchActive || m.stock[mockSKU3] != 3 {
+		t.Fatalf("после «Продолжить» распроданная партия завершается и выставляется следующая: %v %v", st, m.stock)
+	}
 }
